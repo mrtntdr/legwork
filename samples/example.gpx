@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="routes-sample"
+     xmlns="http://www.topografix.com/GPX/1/1"
+     xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">
+  <trk>
+    <name>Sample orienteering run</name>
+    <trkseg>
+      <trkpt lat="59.33000" lon="18.06000"><ele>10.0</ele><time>2024-05-01T10:00:00Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>128</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33025" lon="18.06010"><ele>11.0</ele><time>2024-05-01T10:00:20Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>142</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33050" lon="18.06025"><ele>12.0</ele><time>2024-05-01T10:00:38Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>150</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33078" lon="18.06055"><ele>13.5</ele><time>2024-05-01T10:00:54Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>156</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33100" lon="18.06100"><ele>14.0</ele><time>2024-05-01T10:01:12Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>158</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33110" lon="18.06170"><ele>14.5</ele><time>2024-05-01T10:01:40Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>160</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33115" lon="18.06250"><ele>15.0</ele><time>2024-05-01T10:02:15Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>162</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33140" lon="18.06300"><ele>16.0</ele><time>2024-05-01T10:02:35Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>165</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33175" lon="18.06320"><ele>17.0</ele><time>2024-05-01T10:02:52Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>168</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33210" lon="18.06300"><ele>16.5</ele><time>2024-05-01T10:03:10Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>166</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33240" lon="18.06250"><ele>16.0</ele><time>2024-05-01T10:03:30Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>164</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33255" lon="18.06180"><ele>15.0</ele><time>2024-05-01T10:03:55Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>160</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33260" lon="18.06100"><ele>14.0</ele><time>2024-05-01T10:04:25Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>158</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33240" lon="18.06040"><ele>12.5</ele><time>2024-05-01T10:04:45Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>155</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="59.33210" lon="18.06020"><ele>11.0</ele><time>2024-05-01T10:05:05Z</time>
+        <extensions><gpxtpx:TrackPointExtension><gpxtpx:hr>150</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+    </trkseg>
+  </trk>
+</gpx>
