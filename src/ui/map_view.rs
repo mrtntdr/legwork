@@ -13,7 +13,6 @@ impl App {
             let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
             let origin = rect.min;
 
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             // Ctrl/Cmd+Z removes the most recently added calibration point.
             let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
             if undo && self.calibration.pop().is_some() {
@@ -21,7 +20,7 @@ impl App {
                 self.status = "Undid last calibration point.".into();
             }
             self.maybe_fit_view(rect);
-            self.handle_zoom(&resp, origin, scroll);
+            self.handle_zoom_pan(ui, &resp, origin);
             self.handle_interaction(&resp, origin);
             self.hover_route(&resp, origin);
 
@@ -51,18 +50,62 @@ impl App {
         }
     }
 
-    fn handle_zoom(&mut self, resp: &egui::Response, origin: egui::Pos2, scroll: f32) {
-        if resp.hovered()
-            && scroll != 0.0
-            && let Some(p) = resp.hover_pos()
-        {
+    /// Zoom and pan from wheel/touchpad input, gated on the cursor being over the map.
+    ///
+    /// Three gestures feed in, kept distinct so mouse and touchpad both feel right:
+    /// - **Pinch** (touchpad) and **Ctrl+scroll** arrive as a zoom factor via
+    ///   `zoom_delta()`. On Windows precision touchpads the OS delivers pinch as
+    ///   Ctrl+scroll, so this covers touchpad pinch there too.
+    /// - **Two-finger swipe** on a precision touchpad arrives as pixel-unit
+    ///   (`MouseWheelUnit::Point`) scrolling, which pans the view.
+    /// - A plain **mouse wheel** arrives as line-unit scrolling, which zooms
+    ///   (preserving the classic scroll-to-zoom feel).
+    ///
+    /// Zoom is always anchored on the pointer so the map feature under the cursor
+    /// stays put.
+    fn handle_zoom_pan(&mut self, ui: &egui::Ui, resp: &egui::Response, origin: egui::Pos2) {
+        if !resp.hovered() {
+            return;
+        }
+        let Some(p) = resp.hover_pos() else { return };
+
+        let mut pan = egui::Vec2::ZERO;
+        let mut wheel_zoom = 0.0_f32;
+        let pinch = ui.input(|i| {
+            for ev in &i.events {
+                if let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    ..
+                } = ev
+                {
+                    match unit {
+                        // Two-finger touchpad swipe -> move the map.
+                        egui::MouseWheelUnit::Point => pan += *delta,
+                        // Mouse wheel -> zoom, unless Ctrl is held (that's a zoom
+                        // gesture already accounted for by `zoom_delta()` below).
+                        _ if !modifiers.command && !modifiers.ctrl => wheel_zoom += delta.y,
+                        _ => {}
+                    }
+                }
+            }
+            i.zoom_delta()
+        });
+
+        // Zoom (pinch / Ctrl+scroll / mouse wheel), anchored on the pointer.
+        let factor = pinch * (wheel_zoom * 0.0015).exp();
+        if factor != 1.0 {
             let img_before = self.to_image(origin, p);
-            let factor = (scroll * 0.0015).exp();
             self.view.zoom = (self.view.zoom * factor).clamp(0.005, 200.0);
             let after = self.to_screen(origin, img_before);
             self.view.offset[0] += p.x - after.x;
             self.view.offset[1] += p.y - after.y;
         }
+
+        // Pan from a two-finger swipe.
+        self.view.offset[0] += pan.x;
+        self.view.offset[1] += pan.y;
     }
 
     fn pan(&mut self, resp: &egui::Response) {
