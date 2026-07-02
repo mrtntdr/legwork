@@ -37,8 +37,8 @@ and analyze your legs.
 cargo run --release
 ```
 
-On Linux you need the usual GUI dev packages (see `.github/workflows/ci.yml` for the
-exact list: GTK3, xcb, xkbcommon).
+On Linux you need the usual GUI dev packages: `libgtk-3-dev`, `libxcb-render0-dev`,
+`libxcb-shape0-dev`, `libxcb-xfixes0-dev`, `libxkbcommon-dev`, `libssl-dev`.
 
 ### Try it
 
@@ -74,6 +74,25 @@ Pure-logic layers (`model`, `geo`, `analysis`, `io::track_import`) are unit-test
 
 ## Packaging
 
-CI builds and tests on all three OSes (`.github/workflows/ci.yml`). For distributable
-installers (`.dmg` / `.msi` / tarball) add [`cargo-dist`](https://github.com/axodotdev/cargo-dist):
-`cargo dist init`.
+### macOS (Apple Silicon)
+
+```sh
+scripts/macos/bundle-macos.sh
+```
+
+Builds a native `aarch64-apple-darwin` release, wraps it in a double-clickable
+`dist/Legwork.app` (icon built from `app_icon.png` + `Info.plist`, ad-hoc signed), and
+zips it as `dist/Legwork-<version>-aarch64-apple-darwin.zip`.
+
+The app icon lives at `app_icon.png` (a 1024px master) in the project root; the bundle
+script derives the `.icns` from it at build time.
+
+The bundle is ad-hoc signed, not notarized, so on first launch Gatekeeper will block it.
+Right-click the app → **Open** (or run `xattr -dr com.apple.quarantine dist/Legwork.app`)
+to allow it. For distribution to other machines, sign with a Developer ID certificate and
+notarize.
+
+### Other platforms
+
+For cross-platform installers (`.dmg` / `.msi` / tarball) add
+[`cargo-dist`](https://github.com/axodotdev/cargo-dist): `cargo dist init`.
