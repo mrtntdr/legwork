@@ -92,7 +92,34 @@ Right-click the app → **Open** (or run `xattr -dr com.apple.quarantine dist/Le
 to allow it. For distribution to other machines, sign with a Developer ID certificate and
 notarize.
 
+### Windows (x86_64)
+
+```powershell
+scripts\windows\bundle-windows.ps1
+```
+
+Builds an `x86_64-pc-windows-msvc` release binary (with `app_icon.ico` embedded
+into the `.exe` by `build.rs`, so Explorer and the taskbar show the icon) and
+wraps it in an MSI installer via [`cargo-wix`](https://github.com/volks73/cargo-wix)
+and the WiX 3 Toolset.
+
+Output: `target\wix\legwork-<version>-x86_64.msi`. The installer places Legwork in
+`Program Files`, adds a **Legwork** Start Menu shortcut, and registers it (with the
+app icon) in *Apps & features* for clean uninstall/upgrade.
+
+On first run the script installs `cargo-wix` and downloads the standalone WiX 3
+binaries into `%LOCALAPPDATA%\WiX314` automatically — no admin rights needed. Pass
+`-NoBuild` to package an already-built `target\release\legwork.exe`.
+
+The MSI is unsigned, so on first launch Windows SmartScreen may show a
+"Windows protected your PC" prompt — click **More info → Run anyway**. For
+distribution, sign the `.exe` and `.msi` with an Authenticode code-signing
+certificate.
+
+The installer definition lives at `wix\main.wxs`; edit it to change the install
+layout, shortcuts, or add a EULA.
+
 ### Other platforms
 
-For cross-platform installers (`.dmg` / `.msi` / tarball) add
+For a single cross-platform installer pipeline (`.dmg` / `.msi` / tarball) add
 [`cargo-dist`](https://github.com/axodotdev/cargo-dist): `cargo dist init`.
