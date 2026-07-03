@@ -144,12 +144,68 @@ impl App {
         }
     }
 
-    /// Analysis: a compact athlete list (visibility + active pick), route coloring,
-    /// and the selected-leg summary. No management, nothing that edits the project.
+    /// Analysis: a compact athlete list (visibility + active pick), route coloring
+    /// (only while pace colors are in use), and either the overall leaderboard
+    /// (whole course) or the selected-leg summary. Nothing that edits the project.
     fn analysis_side_panel(&mut self, ui: &mut egui::Ui) {
         self.athletes_section(ui, false);
-        self.coloring_controls(ui);
-        self.leg_summary_section(ui);
+        if self.active_pace_colors {
+            self.coloring_controls(ui);
+        }
+        match self.selected_leg {
+            Some(_) => self.leg_summary_section(ui),
+            None => self.leaderboard_section(ui),
+        }
+    }
+
+    /// Overall standings while the whole course is shown: visible athletes ranked
+    /// by total time, with the gap to the leader.
+    fn leaderboard_section(&self, ui: &mut egui::Ui) {
+        let mut rows: Vec<(usize, Option<f64>)> = (0..self.athletes.len())
+            .filter(|&i| self.athletes[i].visible)
+            .map(|i| (i, self.athletes[i].track.duration_secs()))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        // Timed athletes first, fastest to slowest; untimed tracks at the end.
+        rows.sort_by(|a, b| match (a.1, b.1) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        let best = rows.first().and_then(|&(_, t)| t);
+
+        ui.separator();
+        ui.heading("Leaderboard");
+        for (place, &(i, total)) in rows.iter().enumerate() {
+            let a = &self.athletes[i];
+            ui.horizontal(|ui| {
+                ui.label(format!("{}.", place + 1));
+                ui.label(RichText::new("●").color(a.color));
+                ui.label(&a.name);
+                match total {
+                    Some(secs) => {
+                        let is_best = best.is_some_and(|b| (secs - b).abs() < 0.5);
+                        let text = RichText::new(fmt_duration(secs)).strong();
+                        ui.label(if is_best { text.color(BEST_GREEN) } else { text });
+                        if let Some(b) = best
+                            && !is_best
+                        {
+                            ui.label(
+                                RichText::new(format!("+{}", fmt_duration(secs - b)))
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new("no time").weak());
+                    }
+                }
+            });
+        }
     }
 
     /// Course editing details (Setup · Course mode).
