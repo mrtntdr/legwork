@@ -75,7 +75,9 @@ fn best_index(values: impl Iterator<Item = Option<f64>>) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-fn leg_label(i: usize, n_controls: usize) -> String {
+/// Human label for leg `i` of a course with `n_controls` controls:
+/// "S–1", "1–2", …, "n–F" (or "S–F" when there are no controls).
+pub fn leg_label(i: usize, n_controls: usize) -> String {
     let from = if i == 0 { "S".into() } else { i.to_string() };
     let to = if i == n_controls {
         "F".into()

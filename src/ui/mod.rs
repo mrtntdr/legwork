@@ -2,6 +2,7 @@ mod graphs;
 mod leg_analysis;
 mod map_view;
 mod panels;
+mod playback;
 
 use crate::analysis::color_for;
 use crate::app::App;

@@ -1,6 +1,10 @@
-use crate::analysis::{fmt_duration, fmt_pace, legs_between, quickness_color};
+use crate::analysis::{compare, fmt_duration, fmt_pace, leg_label, legs_between, quickness_color};
 use crate::app::{App, EditMode, ViewTab};
+use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
+
+/// Highlight color for the best (fastest) athlete in the leg summary.
+const BEST_GREEN: Color32 = Color32::from_rgb(80, 210, 120);
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "tiff", "tif", "bmp", "webp"];
 const TRACK_EXTS: &[&str] = &["gpx", "tcx", "xml"];
@@ -150,6 +154,8 @@ impl App {
                     ui.checkbox(&mut self.show_ele, "Elevation");
                 }
 
+                self.leg_summary_section(ui);
+
                 ui.separator();
                 ui.heading("Controls");
                 if !self.controls.is_empty() && ui.button("Clear controls").clicked() {
@@ -158,6 +164,100 @@ impl App {
                 }
                 self.legs_table(ui);
             });
+    }
+
+    /// When a leg is selected on the map, a compact per-athlete summary for that
+    /// leg (time + delta to best, pace, length) with a way back to the full course.
+    fn leg_summary_section(&mut self, ui: &mut egui::Ui) {
+        let Some(li) = self.selected_leg else { return };
+        let visible: Vec<usize> = (0..self.athletes.len())
+            .filter(|&i| self.athletes[i].visible)
+            .collect();
+
+        ui.separator();
+        let mut show_all = false;
+        ui.horizontal(|ui| {
+            ui.heading(format!("Leg {}", leg_label(li, self.controls.len())));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Show all legs").clicked() {
+                    show_all = true;
+                }
+            });
+        });
+
+        if visible.is_empty() {
+            ui.label(RichText::new("No visible athletes.").weak());
+        } else {
+            let boundaries: Vec<Vec<Option<usize>>> = visible
+                .iter()
+                .map(|&i| self.athletes[i].boundaries())
+                .collect();
+            let entries: Vec<_> = visible
+                .iter()
+                .zip(&boundaries)
+                .map(|(&i, b)| (&self.athletes[i].track, b.as_slice()))
+                .collect();
+            let rows = compare(&entries, self.controls.len());
+            if let Some(row) = rows.get(li) {
+                let best_secs = row
+                    .best
+                    .and_then(|b| row.cells[b].leg.as_ref())
+                    .and_then(|l| l.duration_secs);
+                for (ci, &ai) in visible.iter().enumerate() {
+                    let a = &self.athletes[ai];
+                    let cell = &row.cells[ci];
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("●").color(a.color));
+                        ui.label(&a.name);
+                        match cell.leg.as_ref() {
+                            Some(leg) => {
+                                match leg.duration_secs {
+                                    Some(secs) => {
+                                        let is_best = row.best == Some(ci);
+                                        let text = RichText::new(fmt_duration(secs)).strong();
+                                        ui.label(if is_best {
+                                            text.color(BEST_GREEN)
+                                        } else {
+                                            text
+                                        });
+                                        if let Some(b) = best_secs
+                                            && !is_best
+                                        {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "+{}",
+                                                    fmt_duration(secs - b)
+                                                ))
+                                                .weak()
+                                                .small(),
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        ui.label(RichText::new("no time").weak());
+                                    }
+                                }
+                                let pace = leg
+                                    .pace_s_per_km
+                                    .map(fmt_pace)
+                                    .unwrap_or_else(|| "–".into());
+                                ui.label(
+                                    RichText::new(format!("· {pace} · {:.0} m", leg.route_length))
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                            None => {
+                                ui.label(RichText::new("– (control missed)").weak());
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        if show_all {
+            self.select_leg(None);
+        }
     }
 
     /// The athlete list: color swatch, visibility, name (editable for the active

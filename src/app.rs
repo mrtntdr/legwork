@@ -1,11 +1,13 @@
 use crate::analysis::{
-    MetricRange, auto_range, local_scale_px_per_m, match_controls, segment_metric,
+    ClockMode, MetricRange, Window, auto_range, build_timeline, local_scale_px_per_m,
+    match_controls, playback, segment_metric, total_span,
 };
 use crate::athlete::{ATHLETE_COLORS, Athlete};
 use crate::geo::{Correspondence, LocalProjection, MapTransform};
 use crate::io;
 use crate::io::ProjectBundle;
 use crate::model::{AthleteFile, CoursePoint, ProjectFileV2, ViewState};
+use chrono::{DateTime, Utc};
 use egui::{Color32, Pos2, TextureHandle, pos2};
 use std::path::PathBuf;
 
@@ -36,6 +38,53 @@ pub enum DragTarget {
     View,
     Calibration(usize),
     Control(usize),
+}
+
+/// A pending view fit, applied on the next frame once the canvas rect is known.
+#[derive(Clone, Copy)]
+pub enum FitRequest {
+    /// Fit the whole map image into the canvas.
+    Map,
+    /// Fit an image-pixel-space rectangle (min, max) into the canvas.
+    Rect { min: (f64, f64), max: (f64, f64) },
+}
+
+/// Which clock the replay runs on (the user-facing choice; leg-restart is
+/// implied when a leg is selected).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StartMode {
+    MassStart,
+    RealTime,
+}
+
+/// Replay animation state. Transient — never persisted.
+pub struct Playback {
+    pub enabled: bool,
+    pub playing: bool,
+    /// Global replay clock, in seconds.
+    pub clock: f64,
+    /// Playback speed multiplier (real seconds → replay seconds).
+    pub speed: f64,
+    pub mode: StartMode,
+    /// Length of the bright trail behind each dot, in seconds
+    /// (`f64::INFINITY` = the whole route so far).
+    pub tail_secs: f64,
+    /// Animate only the active athlete.
+    pub solo: bool,
+}
+
+impl Default for Playback {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            playing: false,
+            clock: 0.0,
+            speed: 15.0,
+            mode: StartMode::MassStart,
+            tail_secs: 60.0,
+            solo: false,
+        }
+    }
 }
 
 /// Matching radius around a control, in meters on the ground.
@@ -79,7 +128,13 @@ pub struct App {
     pub(crate) active_pace_colors: bool,
     /// Show cumulative times in the leg comparison table.
     pub(crate) show_cumulative: bool,
-    pub(crate) fit_requested: bool,
+    /// A pending view fit, applied next frame; `None` at rest.
+    pub(crate) fit: Option<FitRequest>,
+    /// Selected leg for the on-map leg view (0-based leg index), or `None` for
+    /// the whole-course view. Leg `li` runs from boundary `li` to `li + 1`.
+    pub(crate) selected_leg: Option<usize>,
+    /// Replay animation state.
+    pub(crate) playback: Playback,
 
     /// Cross-highlight between the graphs and the route: the along-track position
     /// (km) currently pointed at, its resolved waypoint index, and this frame's
@@ -117,7 +172,9 @@ impl App {
             show_ele: true,
             active_pace_colors: true,
             show_cumulative: true,
-            fit_requested: false,
+            fit: None,
+            selected_leg: None,
+            playback: Playback::default(),
             hover_km: None,
             hover_index: None,
             pending_hover: None,
@@ -181,7 +238,7 @@ impl App {
                     bytes: loaded.bytes,
                 });
                 self.image_name = name;
-                self.fit_requested = true;
+                self.fit = Some(FitRequest::Map);
                 self.recompute_all_transforms();
                 self.status = format!("Loaded map ({w}x{h}).");
             }
@@ -216,6 +273,7 @@ impl App {
                     track.total_distance() / 1000.0
                 );
                 let seg_metric = segment_metric(&track);
+                let timeline = build_timeline(&track);
                 self.athletes.push(Athlete {
                     name,
                     color: ATHLETE_COLORS[self.athletes.len() % ATHLETE_COLORS.len()],
@@ -228,6 +286,7 @@ impl App {
                     calibration: Vec::new(),
                     transform: None,
                     matched: Vec::new(),
+                    timeline,
                 });
                 self.active = self.athletes.len() - 1;
                 self.recompute_transform_at(self.active);
@@ -404,6 +463,145 @@ impl App {
         for i in 0..self.athletes.len() {
             self.rematch_athlete(i);
         }
+        self.clamp_selected_leg();
+    }
+
+    // --- Leg view --------------------------------------------------------------
+
+    /// Number of legs on the course (start→1, …, n→finish).
+    pub(crate) fn n_legs(&self) -> usize {
+        self.controls.len() + 1
+    }
+
+    /// Drop the leg selection if it no longer addresses a real leg (e.g. controls
+    /// were removed).
+    pub(crate) fn clamp_selected_leg(&mut self) {
+        if let Some(li) = self.selected_leg
+            && li >= self.n_legs()
+        {
+            self.selected_leg = None;
+        }
+    }
+
+    /// Select a leg for the on-map leg view (or `None` for the full course), and
+    /// request a view fit to that leg. Also resets the replay clock so playback
+    /// restarts at the new leg's start.
+    pub(crate) fn select_leg(&mut self, li: Option<usize>) {
+        self.selected_leg = li.filter(|&li| li < self.n_legs());
+        self.playback.clock = 0.0;
+        match self.selected_leg {
+            Some(li) => {
+                if let Some((min, max)) = self.leg_bbox(li) {
+                    self.fit = Some(FitRequest::Rect { min, max });
+                }
+            }
+            None => self.fit = Some(FitRequest::Map),
+        }
+    }
+
+    /// Image-space bounding box of leg `li`: the union of every visible athlete's
+    /// route choice for that leg (where both boundaries matched) plus the leg's two
+    /// controls. `None` if nothing can be located.
+    fn leg_bbox(&self, li: usize) -> Option<((f64, f64), (f64, f64))> {
+        let mut min = (f64::MAX, f64::MAX);
+        let mut max = (f64::MIN, f64::MIN);
+        let mut grow = |(x, y): (f64, f64)| {
+            min.0 = min.0.min(x);
+            min.1 = min.1.min(y);
+            max.0 = max.0.max(x);
+            max.1 = max.1.max(y);
+        };
+        // The leg's endpoint controls (control li-1 .. li in course numbering; for
+        // the start/finish legs one endpoint is an athlete's S/F instead).
+        if li >= 1
+            && let Some(c) = self.controls.get(li - 1)
+        {
+            grow((c.image_px[0], c.image_px[1]));
+        }
+        if li < self.controls.len()
+            && let Some(c) = self.controls.get(li)
+        {
+            grow((c.image_px[0], c.image_px[1]));
+        }
+        // Each visible athlete's route segments for this leg.
+        for a in self.athletes.iter().filter(|a| a.visible) {
+            let Some(t) = &a.transform else { continue };
+            let b = a.boundaries();
+            let (Some(from), Some(to)) = (
+                b.get(li).copied().flatten(),
+                b.get(li + 1).copied().flatten(),
+            ) else {
+                continue;
+            };
+            for &m in &a.projected[from..=to.min(a.projected.len().saturating_sub(1))] {
+                grow(t.apply(m));
+            }
+        }
+        (min.0 <= max.0).then_some((min, max))
+    }
+
+    // --- Replay ----------------------------------------------------------------
+
+    /// Athlete indices to animate, in draw order (non-active first, active last).
+    /// Solo mode animates only the active athlete.
+    pub(crate) fn animated_indices(&self) -> Vec<usize> {
+        if self.playback.solo {
+            return if self.athletes.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.active]
+            };
+        }
+        let mut v: Vec<usize> = (0..self.athletes.len())
+            .filter(|&i| i != self.active && self.athletes[i].visible)
+            .collect();
+        if self.active().is_some_and(|a| a.visible) {
+            v.push(self.active);
+        }
+        v
+    }
+
+    /// The replay clock mode: a leg-restart when a leg is selected, otherwise the
+    /// user's chosen start mode.
+    pub(crate) fn playback_clock_mode(&self) -> ClockMode {
+        match self.selected_leg {
+            Some(li) => ClockMode::Leg(li),
+            None => match self.playback.mode {
+                StartMode::MassStart => ClockMode::MassStart,
+                StartMode::RealTime => ClockMode::RealTime,
+            },
+        }
+    }
+
+    /// Real-time anchor: the earliest start among animated athletes.
+    pub(crate) fn playback_anchor(&self) -> Option<DateTime<Utc>> {
+        self.animated_indices()
+            .iter()
+            .filter_map(|&i| self.athletes[i].start_time())
+            .min()
+    }
+
+    /// Athlete `i`'s playback window under the current mode/leg/anchor.
+    pub(crate) fn window_for(&self, i: usize, anchor: Option<DateTime<Utc>>) -> Option<Window> {
+        let a = self.athletes.get(i)?;
+        let boundaries = a.boundaries();
+        playback::window(
+            &a.timeline,
+            &boundaries,
+            self.playback_clock_mode(),
+            a.start_time(),
+            anchor,
+        )
+    }
+
+    /// Total length of the replay timeline (seconds), across animated athletes.
+    pub(crate) fn playback_total(&self) -> f64 {
+        let anchor = self.playback_anchor();
+        total_span(
+            self.animated_indices()
+                .iter()
+                .filter_map(|&i| self.window_for(i, anchor)),
+        )
     }
 
     // --- Coordinate helpers --------------------------------------------------
@@ -576,7 +774,8 @@ impl App {
         self.rematch_all();
         self.recompute_metric_active();
         self.view = project.view;
-        self.fit_requested = false;
+        self.fit = None;
+        self.selected_leg = None;
         self.project_path = Some(path);
         self.status = "Project opened.".into();
     }
@@ -591,6 +790,7 @@ impl eframe::App for App {
         self.side_panel(ui);
         match self.tab {
             ViewTab::Map => {
+                self.playback_bar(ui);
                 self.bottom_graphs(ui);
                 self.map_panel(ui);
             }

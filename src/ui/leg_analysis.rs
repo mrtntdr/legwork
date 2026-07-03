@@ -1,5 +1,5 @@
 use crate::analysis::{LegRow, compare, fmt_duration, fmt_pace};
-use crate::app::App;
+use crate::app::{App, ViewTab};
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
@@ -51,9 +51,11 @@ impl App {
         });
     }
 
-    fn comparison_table(&self, ui: &mut egui::Ui, visible: &[usize], rows: &[LegRow]) {
+    fn comparison_table(&mut self, ui: &mut egui::Ui, visible: &[usize], rows: &[LegRow]) {
         let show_cum = self.show_cumulative;
         let row_h = if show_cum { 48.0 } else { 34.0 };
+        // Deferred so the click can mutate `self` after the table closure returns.
+        let mut jump_to: Option<usize> = None;
 
         let mut table = TableBuilder::new(ui)
             .striped(true)
@@ -82,10 +84,16 @@ impl App {
                 }
             })
             .body(|mut body| {
-                for row in rows {
+                for (li, row) in rows.iter().enumerate() {
                     body.row(row_h, |mut r| {
                         r.col(|ui| {
-                            ui.label(&row.label);
+                            if ui
+                                .selectable_label(false, RichText::new(&row.label).strong())
+                                .on_hover_text("Show this leg on the map")
+                                .clicked()
+                            {
+                                jump_to = Some(li);
+                            }
                         });
                         let best_secs = row
                             .best
@@ -110,6 +118,11 @@ impl App {
                 }
                 self.total_row(&mut body, visible, row_h);
             });
+
+        if let Some(li) = jump_to {
+            self.select_leg(Some(li));
+            self.tab = ViewTab::Map;
+        }
     }
 
     /// A final row with each athlete's full start→finish time and gap to the winner.

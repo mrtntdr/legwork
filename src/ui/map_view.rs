@@ -1,5 +1,5 @@
 use crate::analysis::color_for;
-use crate::app::{App, DragTarget, EditMode};
+use crate::app::{App, DragTarget, EditMode, FitRequest};
 use crate::athlete::Athlete;
 use crate::model::{CalibrationPoint, CoursePoint};
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2};
@@ -10,9 +10,20 @@ const SNAP_RADIUS: f32 = 40.0;
 impl App {
     pub(crate) fn map_panel(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
+            // The leg strip is laid out first, so it takes its height off the top
+            // and the canvas below it still owns all drag/zoom interactions.
+            self.leg_strip(ui);
+
             let size = ui.available_size();
             let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
             let origin = rect.min;
+
+            // Esc clears a leg selection, returning to the whole-course view.
+            if self.selected_leg.is_some()
+                && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                self.select_leg(None);
+            }
 
             // Ctrl/Cmd+Z removes the active athlete's most recent calibration point.
             let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
@@ -34,21 +45,102 @@ impl App {
     }
 
     fn maybe_fit_view(&mut self, rect: Rect) {
-        if !self.fit_requested {
+        let Some(req) = self.fit else { return };
+        if rect.width() <= 1.0 {
             return;
         }
-        if let Some(map) = &self.map {
-            let (w, h) = (map.size[0] as f32, map.size[1] as f32);
-            if rect.width() > 1.0 && w > 0.0 {
-                let zoom = (rect.width() / w).min(rect.height() / h) * 0.95;
-                self.view.zoom = zoom;
-                self.view.offset = [
-                    (rect.width() - w * zoom) / 2.0,
-                    (rect.height() - h * zoom) / 2.0,
-                ];
-                self.fit_requested = false;
+        // Target image-space box (min, size) and a margin fraction.
+        let (bx, by, bw, bh, margin) = match req {
+            FitRequest::Map => {
+                let Some(map) = &self.map else { return };
+                let (w, h) = (map.size[0] as f64, map.size[1] as f64);
+                if w <= 0.0 || h <= 0.0 {
+                    return;
+                }
+                (0.0, 0.0, w, h, 0.05)
             }
+            FitRequest::Rect { min, max } => {
+                // Pad degenerate (single-point) boxes so we don't divide by zero.
+                let w = (max.0 - min.0).max(1.0);
+                let h = (max.1 - min.1).max(1.0);
+                (min.0, min.1, w, h, 0.15)
+            }
+        };
+        let (rw, rh) = (rect.width() as f64, rect.height() as f64);
+        let zoom = ((rw / bw).min(rh / bh) * (1.0 - margin)).clamp(0.005, 200.0) as f32;
+        // Center the box's center in the canvas.
+        let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
+        self.view.zoom = zoom;
+        self.view.offset = [
+            rect.width() / 2.0 - cx as f32 * zoom,
+            rect.height() / 2.0 - cy as f32 * zoom,
+        ];
+        self.fit = None;
+    }
+
+    /// A row above the map to step through the course leg by leg: prev/next arrows,
+    /// an "All" (whole course) button, and a scrollable list of leg labels. Hidden
+    /// until at least one control exists.
+    fn leg_strip(&mut self, ui: &mut egui::Ui) {
+        if self.controls.is_empty() {
+            self.selected_leg = None;
+            return;
         }
+        let n = self.n_legs();
+        let mut pick: Option<Option<usize>> = None; // Some(None)=All, Some(Some(li))=leg
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Leg").strong());
+            // Prev: from All → last leg, else step back to All at leg 0.
+            if ui.button("◀").on_hover_text("Previous leg").clicked() {
+                pick = Some(match self.selected_leg {
+                    None => Some(n - 1),
+                    Some(0) => None,
+                    Some(li) => Some(li - 1),
+                });
+            }
+            if ui
+                .selectable_label(self.selected_leg.is_none(), "All")
+                .clicked()
+            {
+                pick = Some(None);
+            }
+            egui::ScrollArea::horizontal()
+                .max_width(ui.available_width() - 40.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for li in 0..n {
+                            let label = crate::analysis::leg_label(li, self.controls.len());
+                            if ui
+                                .selectable_label(self.selected_leg == Some(li), label)
+                                .clicked()
+                            {
+                                pick = Some(Some(li));
+                            }
+                        }
+                    });
+                });
+            // Next: from All → leg 0, wrap last → All.
+            if ui.button("▶").on_hover_text("Next leg").clicked() {
+                pick = Some(match self.selected_leg {
+                    None => Some(0),
+                    Some(li) if li + 1 >= n => None,
+                    Some(li) => Some(li + 1),
+                });
+            }
+        });
+        if let Some(sel) = pick {
+            self.select_leg(sel);
+        }
+        ui.separator();
+    }
+
+    /// Segment index range of athlete `a`'s route choice for leg `li` (segment `i`
+    /// connects waypoints `i`..`i+1`), if both leg boundaries matched.
+    fn leg_seg_range(a: &Athlete, li: usize) -> Option<std::ops::Range<usize>> {
+        let b = a.boundaries();
+        let from = b.get(li).copied().flatten()?;
+        let to = b.get(li + 1).copied().flatten()?;
+        (from < to).then_some(from..to)
     }
 
     /// Zoom and pan from wheel/touchpad input, gated on the cursor being over the map.
@@ -315,44 +407,158 @@ impl App {
     }
 
     /// All visible athletes' routes; the active one last (on top), optionally
-    /// pace-colored, the rest in their solid colors.
+    /// pace-colored, the rest in their solid colors. During replay the animated
+    /// dots/tails replace the static routes; when a leg is selected only that
+    /// leg's route choice is drawn.
     fn draw_routes(&self, painter: &egui::Painter, origin: egui::Pos2) {
+        if self.playback.enabled {
+            self.draw_playback(painter, origin);
+            return;
+        }
         let width = (self.view.zoom * 6.0).clamp(1.5, 5.0);
         for (i, a) in self.athletes.iter().enumerate() {
             if a.visible && i != self.active {
-                self.draw_athlete_route(painter, origin, a, width, false);
+                self.draw_athlete_maybe_leg(painter, origin, a, width, false);
             }
         }
         if let Some(a) = self.active()
             && a.visible
         {
-            self.draw_athlete_route(painter, origin, a, width + 1.0, self.active_pace_colors);
+            self.draw_athlete_maybe_leg(painter, origin, a, width + 1.0, self.active_pace_colors);
         }
     }
 
-    fn draw_athlete_route(
+    /// Draw an athlete's whole route, or just its selected leg's route choice.
+    fn draw_athlete_maybe_leg(
+        &self,
+        painter: &egui::Painter,
+        origin: egui::Pos2,
+        a: &Athlete,
+        width: f32,
+        pace_colors: bool,
+    ) {
+        match self.selected_leg {
+            Some(li) => {
+                if let Some(range) = Self::leg_seg_range(a, li) {
+                    self.draw_route_range(painter, origin, a, range, width, pace_colors, 1.0);
+                }
+            }
+            None => {
+                let n = a.projected.len();
+                if n >= 2 {
+                    self.draw_route_range(painter, origin, a, 0..n - 1, width, pace_colors, 1.0);
+                }
+            }
+        }
+    }
+
+    /// Draw segments `seg_range` of an athlete's route (segment `i` connects
+    /// waypoints `i`..`i+1`) at the given alpha multiplier.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_route_range(
         &self,
         painter: &egui::Painter,
         origin: egui::Pos2,
         athlete: &Athlete,
+        seg_range: std::ops::Range<usize>,
         width: f32,
         pace_colors: bool,
+        alpha: f32,
     ) {
         let Some(t) = &athlete.transform else { return };
-        if athlete.projected.len() < 2 {
-            return;
-        }
-        let mut prev = self.to_screen(origin, t.apply(athlete.projected[0]));
-        for i in 1..athlete.projected.len() {
-            let cur = self.to_screen(origin, t.apply(athlete.projected[i]));
+        let last_seg = athlete.projected.len().saturating_sub(1);
+        for i in seg_range.start..seg_range.end.min(last_seg) {
+            let p0 = self.to_screen(origin, t.apply(athlete.projected[i]));
+            let p1 = self.to_screen(origin, t.apply(athlete.projected[i + 1]));
             let color = if pace_colors {
-                let pace = athlete.seg_metric.get(i - 1).copied().unwrap_or(f64::NAN);
+                let pace = athlete.seg_metric.get(i).copied().unwrap_or(f64::NAN);
                 color_for(pace, self.metric_range)
             } else {
                 athlete.color
             };
-            painter.line_segment([prev, cur], Stroke::new(width, color));
-            prev = cur;
+            let color = if alpha < 1.0 {
+                color.gamma_multiply(alpha)
+            } else {
+                color
+            };
+            painter.line_segment([p0, p1], Stroke::new(width, color));
+        }
+    }
+
+    /// Replay rendering: a faint base route per animated athlete, a bright tail of
+    /// the last `tail_secs` behind a moving dot at the current clock. When a leg is
+    /// selected everyone restarts together at that leg's start control.
+    fn draw_playback(&self, painter: &egui::Painter, origin: egui::Pos2) {
+        use crate::analysis::{index_at, position_at};
+
+        let animated = self.animated_indices();
+        let anchor = self.playback_anchor();
+        let clock = self.playback.clock;
+        let tail_secs = self.playback.tail_secs;
+        let base_w = (self.view.zoom * 6.0).clamp(1.5, 5.0);
+
+        for &i in &animated {
+            let a = &self.athletes[i];
+            let Some(t) = &a.transform else { continue };
+            let Some(win) = self.window_for(i, anchor) else {
+                continue;
+            };
+            let is_active = i == self.active;
+            let width = if is_active { base_w + 1.0 } else { base_w };
+
+            // The waypoint span this athlete may occupy (whole route, or the leg).
+            let (lo_wp, hi_wp) = match self.selected_leg {
+                Some(li) => match Self::leg_seg_range(a, li) {
+                    Some(r) => (r.start, r.end),
+                    None => continue,
+                },
+                None => (0, a.projected.len().saturating_sub(1)),
+            };
+
+            // Faint base route (whole route or leg) for context.
+            if hi_wp > lo_wp {
+                self.draw_route_range(painter, origin, a, lo_wp..hi_wp, width, false, 0.22);
+            }
+
+            let track_time = win.track_time(clock);
+            let head = index_at(&a.timeline, track_time)
+                .map(|h| h.clamp(lo_wp, hi_wp))
+                .unwrap_or(lo_wp);
+            let tail_start_time = if tail_secs.is_infinite() {
+                win.t0
+            } else {
+                (track_time - tail_secs).max(win.t0)
+            };
+            let tail_start = index_at(&a.timeline, tail_start_time)
+                .map(|s| s.clamp(lo_wp, hi_wp))
+                .unwrap_or(lo_wp);
+
+            // Bright tail up to the last passed waypoint.
+            if head > tail_start {
+                self.draw_route_range(painter, origin, a, tail_start..head, width + 1.0, false, 1.0);
+            }
+
+            // Interpolated dot position and the partial last segment to it.
+            if let Some(m) = position_at(&a.timeline, &a.projected, track_time) {
+                let dot = self.to_screen(origin, t.apply(m));
+                if let Some(&hm) = a.projected.get(head) {
+                    let hp = self.to_screen(origin, t.apply(hm));
+                    painter.line_segment([hp, dot], Stroke::new(width + 1.0, a.color));
+                }
+                let r = (self.view.zoom * 7.0).clamp(4.0, 8.0);
+                painter.circle_filled(dot, r, a.color);
+                painter.circle_stroke(dot, r, Stroke::new(2.0, Color32::WHITE));
+                // Name label when more than one athlete is animating.
+                if animated.len() > 1 {
+                    painter.text(
+                        dot + egui::vec2(r + 3.0, -(r + 3.0)),
+                        Align2::LEFT_BOTTOM,
+                        &a.name,
+                        FontId::proportional(12.0),
+                        a.color,
+                    );
+                }
+            }
         }
     }
 
@@ -394,16 +600,22 @@ impl App {
             painter.circle_filled(s, 3.0, yellow);
         }
 
-        // The active athlete's start/finish.
+        // The active athlete's start/finish. In leg view only the relevant end is
+        // shown (S on the first leg, F on the last).
+        let n_legs = self.n_legs();
+        let show_s = self.selected_leg.is_none_or(|li| li == 0);
+        let show_f = self.selected_leg.is_none_or(|li| li + 1 == n_legs);
         if let Some(a) = self.active()
             && !a.track.is_empty()
         {
             let last = a.track.len() - 1;
-            for (idx, label, color) in [
-                (0, "S", Color32::from_rgb(40, 170, 60)),
-                (last, "F", Color32::from_rgb(200, 40, 40)),
+            for (idx, label, color, show) in [
+                (0, "S", Color32::from_rgb(40, 170, 60), show_s),
+                (last, "F", Color32::from_rgb(200, 40, 40), show_f),
             ] {
-                if let Some(s) = self.waypoint_screen(origin, idx) {
+                if show
+                    && let Some(s) = self.waypoint_screen(origin, idx)
+                {
                     painter.circle_filled(s, 8.0, color);
                     painter.circle_stroke(s, 8.0, Stroke::new(1.5, Color32::WHITE));
                     painter.text(
@@ -417,24 +629,41 @@ impl App {
             }
         }
 
-        // Shared course controls, numbered in course order. A control the active
-        // athlete's route never passes gets a warning ring.
+        // Shared course controls, numbered in course order. In leg view the two
+        // controls bounding the selected leg stay prominent; the rest are dimmed.
+        // A leg-relevant control the active athlete never passes gets a warning ring.
+        let pink = Color32::from_rgb(230, 30, 120);
         for (n, c) in self.controls.iter().enumerate() {
             let s = self.to_screen(origin, (c.image_px[0], c.image_px[1]));
-            painter.circle_filled(s, 8.0, Color32::from_rgb(230, 30, 120));
-            painter.circle_stroke(s, 8.0, Stroke::new(1.5, Color32::WHITE));
+            let relevant = self
+                .selected_leg
+                .is_none_or(|li| n + 1 == li || n == li);
+            let (r, fill, ring, text_color) = if relevant {
+                let r = if self.selected_leg.is_some() { 9.0 } else { 8.0 };
+                (r, pink, Color32::WHITE, Color32::WHITE)
+            } else {
+                (
+                    7.0,
+                    pink.gamma_multiply(0.4),
+                    Color32::from_gray(150),
+                    Color32::from_gray(210),
+                )
+            };
+            painter.circle_filled(s, r, fill);
+            painter.circle_stroke(s, r, Stroke::new(1.5, ring));
             painter.text(
                 s,
                 Align2::CENTER_CENTER,
                 (n + 1).to_string(),
                 FontId::proportional(11.0),
-                Color32::WHITE,
+                text_color,
             );
-            if let Some(a) = self.active()
+            if relevant
+                && let Some(a) = self.active()
                 && a.transform.is_some()
                 && a.matched.get(n).copied().flatten().is_none()
             {
-                painter.circle_stroke(s, 12.0, Stroke::new(2.0, Color32::from_rgb(255, 170, 0)));
+                painter.circle_stroke(s, r + 4.0, Stroke::new(2.0, Color32::from_rgb(255, 170, 0)));
             }
         }
     }

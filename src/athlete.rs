@@ -1,5 +1,6 @@
 use crate::geo::MapTransform;
 use crate::model::{CalibrationPoint, Track};
+use chrono::{DateTime, Utc};
 use egui::Color32;
 
 /// Distinct solid route colors, cycled as athletes are added.
@@ -34,6 +35,9 @@ pub struct Athlete {
     /// Per shared control (course order): this athlete's matched waypoint index,
     /// `None` where the route never passes near the control.
     pub matched: Vec<Option<usize>>,
+    /// Replay timeline: `(seconds_from_first_timestamp, waypoint_index)` for every
+    /// timestamped point, built once on load. Empty for tracks without timestamps.
+    pub timeline: Vec<(f64, usize)>,
 }
 
 impl Athlete {
@@ -48,6 +52,14 @@ impl Athlete {
         b.extend(self.matched.iter().copied());
         b.push(Some(self.track.len() - 1));
         b
+    }
+
+    /// The athlete's first recorded timestamp (real-time replay anchor).
+    pub fn start_time(&self) -> Option<DateTime<Utc>> {
+        self.timeline
+            .first()
+            .and_then(|&(_, i)| self.track.points.get(i))
+            .and_then(|p| p.time)
     }
 }
 
@@ -77,6 +89,7 @@ mod tests {
             calibration: Vec::new(),
             transform: None,
             matched,
+            timeline: Vec::new(),
         }
     }
 
