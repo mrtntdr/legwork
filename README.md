@@ -1,35 +1,70 @@
 # Legwork
 
-Orienteering analysis app in Rust inspired by QuickRoute.
+Orienteering analysis app in Rust inspired by QuickRoute and Livelox.
 
-Load a photo or scan of your map, drop a GPX/TCX track on top, georeference it by
-dragging a few route points onto matching map features, color the route by pace/speed,
-and analyze your legs.
+Load a photo or scan of your map, drop one or more GPX/TCX tracks on top, georeference
+them by dragging a few route points onto matching map features, define the course, and
+compare athletes leg by leg — on the map, in a splits table, and as an animated replay.
+
+The app is organized around two activities:
+
+- **Setup** — load the map and tracks, calibrate each athlete, place the course.
+- **Analysis** — the map is the read-only centerpiece: step through legs, replay the
+  race, and open the splits/graphs drawers. A saved project opens straight here.
 
 ## Features
+
+### Setup
 
 - **Map image**: open JPEG / PNG / GIF / TIFF / BMP / WebP; pan & zoom canvas.
 - **Track import**: unified GPX and TCX parser (captures time, elevation, and heart rate
   from GPX `gpxtpx` extensions and TCX `HeartRateBpm`).
-- **Georeferencing**: drag route points onto matching map features to lock them. Each
-  locked point is honored *exactly* — 1 → translation, 2 → similarity, 3+ →
-  **interpolating thin-plate spline** that warps the surrounding route locked points
-  (handles angled phone photos), so previously-placed points never drift. Live
-  fit-residual readout.
-- **Coloring**: route segments colored **blue (slow) → red (quick)** by pace. In Controls
-  mode the right pane has a **Coloring** palette that combines the pace scale (min/km) with
-  the color gradient: drag the blue (slow) and red (quick) handles on the palette to set the
-  cutoffs, or use "Auto" to fit the range to the run.
-- **Run graphs**: in Controls view, pace, heart-rate and elevation graphs of the run appear at
-  the bottom (vertical marks at each control), each toggled individually from the **Graphs**
-  section in the right pane. Hovering a graph shows the value at that point and a shared
-  cursor across all graphs, and highlights the matching spot on the route; hovering the route
-  moves the graph cursor too.
-- **Controls & legs**: click to place a control, right-click to remove one; the legs table
-  shows per-leg time, route length, detour %, and pace.
-- **Persistence**: save/open a single `.legit` container (zip of image + track + JSON).
-  Projects saved as `.route` before the rename still open.
-- **Export**: render the analyzed map (route + controls burned in) to PNG.
+- **Multiple athletes**: add any number of tracks against one shared map. Each athlete
+  has a name, a route color, a visibility toggle, and their **own calibration**, so GPS
+  offsets between different watches are corrected per person. One *active* athlete
+  drives calibration, graphs, and pace coloring.
+- **Georeferencing** (Calibrate mode): drag route points onto matching map features to
+  lock them. Each locked point is honored *exactly* — 1 → translation, 2 → similarity,
+  3+ → **interpolating thin-plate spline** that warps the route (handles angled phone
+  photos), so previously-placed points never drift. Live fit-residual readout. A newly
+  added athlete borrows the best-calibrated athlete's transform, so it lands roughly
+  aligned before its first pin.
+- **Shared course** (Course mode): click the map to place controls, drag to move them,
+  right-click to remove. Every athlete's track is automatically matched to its nearest
+  pass by each control (scale-aware radius, monotone along the track), so legs are
+  comparable across athletes; a control someone never visits gets a warning ring.
+
+### Analysis
+
+- **Leg view on the map**: a strip above the map steps through the course leg by leg
+  (arrows, clickable labels, or ←/→). Selecting a leg zooms to it, draws only each
+  athlete's route choice for that leg, and dims the other controls. Clicking a control
+  on the map jumps to its leg; `Esc` returns to the whole course.
+- **Replay animation**: athletes as moving dots with bright tails over faint routes —
+  play/pause (`Space`), draggable timeline, speed (1–120×), tail length, and a **Solo**
+  toggle for a single athlete. Start modes: **Mass start** (everyone's clock zeroed at
+  their own start), **Real time** (actual wall-clock offsets), and with a leg selected
+  everyone **restarts together at that control** (Livelox-style).
+- **Splits drawer**: a leg-by-leg comparison table — per-athlete time with delta to the
+  best split (fastest in green), pace and length, optional cumulative times with gaps,
+  and a total row. A missed control blanks only its adjacent legs; cumulative gaps
+  recover at the next matched control. Clicking a leg's label zooms the map to it.
+- **Leaderboard / leg summary**: with the whole course shown, the side panel ranks
+  visible athletes by total time with gaps to the leader; with a leg selected it shows
+  that leg's times, deltas, pace, and length.
+- **Coloring**: the active route can be colored **blue (slow) → red (quick)** by pace;
+  the palette combines the pace scale (min/km) with the gradient — drag the handles to
+  set cutoffs, or use "Auto" to fit the range to the run.
+- **Graphs drawer**: pace, heart-rate and elevation graphs of the active athlete's run
+  (vertical marks at each matched control). Hovering a graph shows a shared cursor
+  across all graphs and highlights the matching spot on the route, and vice versa.
+
+### Files
+
+- **Persistence**: save/open a single `.legit` container (zip of image + tracks + JSON)
+  holding all athletes, calibrations, and the course. Old single-track projects
+  (including pre-rename `.route` files) still open and are migrated transparently.
+- **Export**: render the analyzed map (all visible routes + controls burned in) to PNG.
 
 ## Build & run
 
@@ -42,35 +77,44 @@ On Linux you need the usual GUI dev packages: `libgtk-3-dev`, `libxcb-render0-de
 
 ### Try it
 
-1. Run the app.
-2. **Open Map…** and pick a photo/scan of an orienteering map.
-3. **Open Track…** and pick `samples/example.gpx` (or your own GPX/TCX).
-   The route appears overlaid via an initial bounding-box fit.
-4. Switch to **Calibrate** mode. Press on a point of the route and drag it onto the
+1. Run the app (it opens on the **Setup** tab).
+2. **File → Open Map…** and pick a photo/scan of an orienteering map.
+3. **File → Add Track…** and pick `samples/example.gpx` (or your own GPX/TCX).
+   The route appears overlaid via an initial bounding-box fit. Add more tracks the
+   same way — each becomes an athlete with its own color.
+4. In **Calibrate** mode, press on a point of the active route and drag it onto the
    matching feature on the map, then release to lock it. Add more points the same way:
    one point translates the route, two rotate/scale it, three or more warp it (TPS) so
-   every locked point stays exactly on its feature.
-5. Switch to **Controls** mode and click along the route to place controls; read the legs
-   table on the right.
-6. **Save Project…** to a `.legit` file, or **Export PNG…**.
+   every locked point stays exactly on its feature. Other athletes inherit the
+   alignment; pick each one in the Athletes list to fine-tune their own pins.
+5. In **Course** mode, click the map to place controls along the route. Every
+   athlete is matched to the course automatically.
+6. Switch to the **Analysis** tab: step through legs with the strip above the map
+   (or ←/→), open the **Splits** and **Graphs** drawers from the bottom bar, and
+   tick **Replay** to animate the race (`Space` to play/pause).
+7. **File → Save Project…** to a `.legit` file, or **File → Export PNG…**.
 
-Drag empty map space to pan and scroll to zoom in either mode.
+Drag empty map space to pan and scroll to zoom on either tab.
 
 ## Architecture
 
 ```
 src/
   main.rs            eframe entry point
-  app.rs             App state + eframe::App impl, coordinate + transform plumbing
-  model/             Waypoint/Track, project (serde) types
+  app.rs             App state + eframe::App impl, coordinate + transform plumbing,
+                     leg selection and replay orchestration
+  athlete.rs         per-athlete runtime state (track, calibration, transform,
+                     control matches, replay timeline)
+  model/             Waypoint/Track, project (serde) types incl. V1→V2 migration
   io/                GPX/TCX parser, image loader, .legit container, PNG export
   geo/               local projection + similarity / TPS interpolating warp solving
-  analysis/          per-leg metrics, pace/speed coloring
-  ui/                map canvas (pan/zoom/drag) and side/top panels
+  analysis/          per-leg metrics, control↔track matching, cross-athlete
+                     comparison, replay timing, pace/speed coloring
+  ui/                map canvas (pan/zoom/drag, leg view, replay rendering),
+                     top/side panels, splits & graphs drawers, transport bar
 ```
 
-Pure-logic layers (`model`, `geo`, `analysis`, `io::track_import`) are unit-tested:
-`cargo test`.
+Pure-logic layers (`model`, `geo`, `analysis`, `io`) are unit-tested: `cargo test`.
 
 ## Packaging
 
