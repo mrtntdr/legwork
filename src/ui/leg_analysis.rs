@@ -1,54 +1,59 @@
 use crate::analysis::{LegRow, compare, fmt_duration, fmt_pace};
-use crate::app::{App, ViewTab};
+use crate::app::App;
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
 const BEST_GREEN: Color32 = Color32::from_rgb(80, 210, 120);
 
 impl App {
-    /// The Leg Analysis tab: a leg-by-leg comparison table of all visible athletes
-    /// against the shared course.
-    pub(crate) fn leg_analysis_panel(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Leg-by-leg comparison");
+    /// The Splits drawer (Analysis tab): a resizable bottom panel with the
+    /// leg-by-leg comparison table of all visible athletes, on demand so the map
+    /// keeps center stage.
+    pub(crate) fn splits_drawer(&mut self, ui: &mut egui::Ui) {
+        if !self.show_splits {
+            return;
+        }
+        egui::Panel::bottom("splits")
+            .resizable(true)
+            .default_size(230.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Splits");
+                    ui.checkbox(&mut self.show_cumulative, "Cumulative times");
+                    if self.controls.is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "place controls in Setup · Course to split the course into legs",
+                            )
+                            .weak(),
+                        );
+                    }
+                });
 
-            let visible: Vec<usize> = (0..self.athletes.len())
-                .filter(|&i| self.athletes[i].visible)
-                .collect();
-            if visible.is_empty() {
-                ui.label("Add a GPS track (and tick it visible) to compare legs.");
-                return;
-            }
-            if self.controls.is_empty() {
-                ui.label(
-                    RichText::new(
-                        "No controls yet — place them on the Map tab (Controls mode) to split \
-                         the course into legs.",
-                    )
-                    .weak(),
-                );
-            }
-            if visible.len() < 2 {
-                ui.label(
-                    RichText::new("Add more athletes to compare routes leg by leg.").weak(),
-                );
-            }
-            ui.checkbox(&mut self.show_cumulative, "Cumulative times");
-            ui.add_space(6.0);
+                let visible: Vec<usize> = (0..self.athletes.len())
+                    .filter(|&i| self.athletes[i].visible)
+                    .collect();
+                if visible.is_empty() {
+                    ui.label(
+                        RichText::new("Add a GPS track (and tick it visible) to compare legs.")
+                            .weak(),
+                    );
+                    return;
+                }
 
-            let boundaries: Vec<Vec<Option<usize>>> = visible
-                .iter()
-                .map(|&i| self.athletes[i].boundaries())
-                .collect();
-            let entries: Vec<_> = visible
-                .iter()
-                .zip(&boundaries)
-                .map(|(&i, b)| (&self.athletes[i].track, b.as_slice()))
-                .collect();
-            let rows = compare(&entries, self.controls.len());
+                let boundaries: Vec<Vec<Option<usize>>> = visible
+                    .iter()
+                    .map(|&i| self.athletes[i].boundaries())
+                    .collect();
+                let entries: Vec<_> = visible
+                    .iter()
+                    .zip(&boundaries)
+                    .map(|(&i, b)| (&self.athletes[i].track, b.as_slice()))
+                    .collect();
+                let rows = compare(&entries, self.controls.len());
 
-            self.comparison_table(ui, &visible, &rows);
-        });
+                self.comparison_table(ui, &visible, &rows);
+            });
     }
 
     fn comparison_table(&mut self, ui: &mut egui::Ui, visible: &[usize], rows: &[LegRow]) {
@@ -120,8 +125,8 @@ impl App {
             });
 
         if let Some(li) = jump_to {
+            // The map is right behind the drawer — just zoom it to the leg.
             self.select_leg(Some(li));
-            self.tab = ViewTab::Map;
         }
     }
 

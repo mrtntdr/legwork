@@ -1,5 +1,5 @@
 use crate::analysis::{fmt_duration, fmt_pace, quickness_color};
-use crate::app::{App, EditMode};
+use crate::app::App;
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
 
 const RED: Color32 = Color32::from_rgb(240, 70, 70);
@@ -11,12 +11,11 @@ const ELE_COLOR: Color32 = Color32::from_rgb(150, 170, 120);
 const RIGHT_GUTTER: f32 = 20.0;
 
 impl App {
-    /// A bottom panel (only while placing controls, and when enabled) with pace,
-    /// heart-rate and elevation graphs of the run. Coloring is controlled from the
-    /// right-hand pane; the pace graph just shows the current cutoffs for reference.
+    /// The Graphs drawer (Analysis tab): pace, heart-rate and elevation graphs of
+    /// the active athlete's run. Coloring is controlled from the right-hand pane;
+    /// the pace graph just shows the current cutoffs for reference.
     pub(crate) fn bottom_graphs(&mut self, ui: &mut egui::Ui) {
-        // Graphs only appear in Controls mode; each is toggled from the right pane.
-        if self.mode != EditMode::Control || !(self.show_pace || self.show_hr || self.show_ele) {
+        if !self.show_graphs {
             return;
         }
         let Some(data) = self.build_graph_data() else {
@@ -46,6 +45,12 @@ impl App {
             .default_size(320.0)
             .resizable(true)
             .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Graphs");
+                    ui.checkbox(&mut self.show_pace, "Pace");
+                    ui.checkbox(&mut self.show_hr, "Heart rate");
+                    ui.checkbox(&mut self.show_ele, "Elevation");
+                });
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if show_pace {
                         hovered = hovered.or(draw_pace_plot(

@@ -1,5 +1,5 @@
 use crate::analysis::color_for;
-use crate::app::{App, DragTarget, EditMode, FitRequest};
+use crate::app::{App, DragTarget, EditMode, FitRequest, ViewTab};
 use crate::athlete::Athlete;
 use crate::model::{CalibrationPoint, CoursePoint};
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2};
@@ -10,26 +10,26 @@ const SNAP_RADIUS: f32 = 40.0;
 impl App {
     pub(crate) fn map_panel(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
+            let analysis = self.tab == ViewTab::Analysis;
             // The leg strip is laid out first, so it takes its height off the top
             // and the canvas below it still owns all drag/zoom interactions.
-            self.leg_strip(ui);
+            if analysis {
+                self.leg_strip(ui);
+            }
 
             let size = ui.available_size();
             let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
             let origin = rect.min;
 
-            // Esc clears a leg selection, returning to the whole-course view.
-            if self.selected_leg.is_some()
-                && ui.input(|i| i.key_pressed(egui::Key::Escape))
-            {
-                self.select_leg(None);
-            }
-
-            // Ctrl/Cmd+Z removes the active athlete's most recent calibration point.
-            let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
-            if undo && self.active_mut().is_some_and(|a| a.calibration.pop().is_some()) {
-                self.recompute_transform_active();
-                self.status = "Undid last calibration point.".into();
+            if analysis {
+                self.analysis_shortcuts(ui);
+            } else {
+                // Ctrl/Cmd+Z removes the active athlete's latest calibration point.
+                let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
+                if undo && self.active_mut().is_some_and(|a| a.calibration.pop().is_some()) {
+                    self.recompute_transform_active();
+                    self.status = "Undid last calibration point.".into();
+                }
             }
             self.maybe_fit_view(rect);
             self.handle_zoom_pan(ui, &resp, origin);
@@ -42,6 +42,49 @@ impl App {
             self.draw_routes(&painter, origin);
             self.draw_markers(&painter, origin);
         });
+    }
+
+    /// Analysis-tab keyboard shortcuts: ←/→ step legs, Esc = whole course,
+    /// Space = play/pause the replay. Skipped while a text field has focus.
+    fn analysis_shortcuts(&mut self, ui: &mut egui::Ui) {
+        if ui.ctx().memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let (left, right, esc, space) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Space),
+            )
+        });
+        if esc && self.selected_leg.is_some() {
+            self.select_leg(None);
+        }
+        if !self.controls.is_empty() {
+            let n = self.n_legs();
+            if left {
+                self.select_leg(match self.selected_leg {
+                    None => Some(n - 1),
+                    Some(0) => None,
+                    Some(li) => Some(li - 1),
+                });
+            }
+            if right {
+                self.select_leg(match self.selected_leg {
+                    None => Some(0),
+                    Some(li) if li + 1 >= n => None,
+                    Some(li) => Some(li + 1),
+                });
+            }
+        }
+        if space && self.playback.enabled {
+            let total = self.playback_total();
+            if !self.playback.playing && self.playback.clock >= total {
+                self.playback.clock = 0.0;
+            }
+            self.playback.playing = !self.playback.playing;
+        }
     }
 
     fn maybe_fit_view(&mut self, rect: Rect) {
@@ -143,6 +186,14 @@ impl App {
         (from < to).then_some(from..to)
     }
 
+    /// The leg selection as it applies to map rendering — only the Analysis tab
+    /// isolates legs; Setup always shows whole routes.
+    fn effective_leg(&self) -> Option<usize> {
+        (self.tab == ViewTab::Analysis)
+            .then_some(self.selected_leg)
+            .flatten()
+    }
+
     /// Zoom and pan from wheel/touchpad input, gated on the cursor being over the map.
     ///
     /// Three gestures feed in, kept distinct so mouse and touchpad both feel right:
@@ -222,9 +273,27 @@ impl App {
     }
 
     fn handle_interaction(&mut self, resp: &egui::Response, origin: egui::Pos2) {
-        match self.mode {
-            EditMode::Calibrate => self.handle_calibrate(resp, origin),
-            EditMode::Control => self.handle_control_mode(resp, origin),
+        match self.tab {
+            // Setup: the map is editable via the current mode.
+            ViewTab::Setup => match self.mode {
+                EditMode::Calibrate => self.handle_calibrate(resp, origin),
+                EditMode::Control => self.handle_control_mode(resp, origin),
+            },
+            // Analysis: read-only — pan/zoom, and clicking a control jumps to a leg.
+            ViewTab::Analysis => {
+                if resp.dragged() {
+                    self.pan(resp);
+                }
+                if resp.clicked()
+                    && let Some(p) = resp.interact_pointer_pos()
+                    && let Some(k) = self.control_at(origin, p)
+                {
+                    // Control k bounds legs k (into it) and k+1 (out of it):
+                    // click selects the incoming leg, click again for the outgoing.
+                    let li = if self.selected_leg == Some(k) { k + 1 } else { k };
+                    self.select_leg(Some(li));
+                }
+            }
         }
     }
 
@@ -411,7 +480,7 @@ impl App {
     /// dots/tails replace the static routes; when a leg is selected only that
     /// leg's route choice is drawn.
     fn draw_routes(&self, painter: &egui::Painter, origin: egui::Pos2) {
-        if self.playback.enabled {
+        if self.playback.enabled && self.tab == ViewTab::Analysis {
             self.draw_playback(painter, origin);
             return;
         }
@@ -437,7 +506,7 @@ impl App {
         width: f32,
         pace_colors: bool,
     ) {
-        match self.selected_leg {
+        match self.effective_leg() {
             Some(li) => {
                 if let Some(range) = Self::leg_seg_range(a, li) {
                     self.draw_route_range(painter, origin, a, range, width, pace_colors, 1.0);
@@ -507,7 +576,7 @@ impl App {
             let width = if is_active { base_w + 1.0 } else { base_w };
 
             // The waypoint span this athlete may occupy (whole route, or the leg).
-            let (lo_wp, hi_wp) = match self.selected_leg {
+            let (lo_wp, hi_wp) = match self.effective_leg() {
                 Some(li) => match Self::leg_seg_range(a, li) {
                     Some(r) => (r.start, r.end),
                     None => continue,
@@ -565,9 +634,10 @@ impl App {
     fn draw_markers(&self, painter: &egui::Painter, origin: egui::Pos2) {
         // Calibration pins: prominent locked markers (crosshair + ring) so it's clear
         // the route point is pinned to that exact map feature. Only the active
-        // athlete's pins, and only while calibrating, to keep the map clean.
+        // athlete's pins, and only while calibrating in Setup, to keep the map clean.
         let cyan = Color32::from_rgb(0, 200, 255);
-        if self.mode == EditMode::Calibrate
+        if self.tab == ViewTab::Setup
+            && self.mode == EditMode::Calibrate
             && let Some(a) = self.active()
         {
             for (i, c) in a.calibration.iter().enumerate() {
@@ -603,8 +673,9 @@ impl App {
         // The active athlete's start/finish. In leg view only the relevant end is
         // shown (S on the first leg, F on the last).
         let n_legs = self.n_legs();
-        let show_s = self.selected_leg.is_none_or(|li| li == 0);
-        let show_f = self.selected_leg.is_none_or(|li| li + 1 == n_legs);
+        let leg = self.effective_leg();
+        let show_s = leg.is_none_or(|li| li == 0);
+        let show_f = leg.is_none_or(|li| li + 1 == n_legs);
         if let Some(a) = self.active()
             && !a.track.is_empty()
         {
@@ -635,11 +706,9 @@ impl App {
         let pink = Color32::from_rgb(230, 30, 120);
         for (n, c) in self.controls.iter().enumerate() {
             let s = self.to_screen(origin, (c.image_px[0], c.image_px[1]));
-            let relevant = self
-                .selected_leg
-                .is_none_or(|li| n + 1 == li || n == li);
+            let relevant = leg.is_none_or(|li| n + 1 == li || n == li);
             let (r, fill, ring, text_color) = if relevant {
-                let r = if self.selected_leg.is_some() { 9.0 } else { 8.0 };
+                let r = if leg.is_some() { 9.0 } else { 8.0 };
                 (r, pink, Color32::WHITE, Color32::WHITE)
             } else {
                 (

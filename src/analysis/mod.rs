@@ -8,7 +8,7 @@ pub use coloring::{MetricRange, auto_range, color_for, quickness_color, segment_
 
 pub use compare::{LegRow, compare, leg_label};
 
-pub use leg::{fmt_duration, fmt_pace, legs_between};
+pub use leg::{fmt_duration, fmt_pace};
 
 pub use matching::{local_scale_px_per_m, match_controls};
 

@@ -18,14 +18,16 @@ pub struct MapImage {
     pub bytes: Vec<u8>,
 }
 
-/// The top-level view: the map canvas or the leg-by-leg comparison.
+/// The two activities the app is organized around: **Setup** (load the map and
+/// tracks, calibrate, build the course) and **Analysis** (legs, replay, splits —
+/// the map is read-only there so analysis clicks can't edit the project).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ViewTab {
-    Map,
-    LegAnalysis,
+    Setup,
+    Analysis,
 }
 
-/// What a canvas click/drag currently does. (Dragging empty space always pans.)
+/// What a Setup-tab canvas click/drag does. (Dragging empty space always pans.)
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EditMode {
     Calibrate,
@@ -128,6 +130,10 @@ pub struct App {
     pub(crate) active_pace_colors: bool,
     /// Show cumulative times in the leg comparison table.
     pub(crate) show_cumulative: bool,
+    /// The Splits drawer (leg-by-leg comparison table) in the Analysis tab.
+    pub(crate) show_splits: bool,
+    /// The Graphs drawer (pace/HR/elevation) in the Analysis tab.
+    pub(crate) show_graphs: bool,
     /// A pending view fit, applied next frame; `None` at rest.
     pub(crate) fit: Option<FitRequest>,
     /// Selected leg for the on-map leg view (0-based leg index), or `None` for
@@ -163,7 +169,7 @@ impl App {
             color_auto: true,
             palette_view: None,
             pace_cap_minkm: None,
-            tab: ViewTab::Map,
+            tab: ViewTab::Setup,
             view: ViewState::default(),
             mode: EditMode::Calibrate,
             drag: None,
@@ -172,6 +178,8 @@ impl App {
             show_ele: true,
             active_pace_colors: true,
             show_cumulative: true,
+            show_splits: false,
+            show_graphs: false,
             fit: None,
             selected_leg: None,
             playback: Playback::default(),
@@ -776,6 +784,8 @@ impl App {
         self.view = project.view;
         self.fit = None;
         self.selected_leg = None;
+        // A saved project is already set up — land straight in Analysis.
+        self.tab = ViewTab::Analysis;
         self.project_path = Some(path);
         self.status = "Project opened.".into();
     }
@@ -789,12 +799,15 @@ impl eframe::App for App {
         self.top_bar(ui);
         self.side_panel(ui);
         match self.tab {
-            ViewTab::Map => {
+            ViewTab::Setup => self.map_panel(ui),
+            ViewTab::Analysis => {
+                // Bottom stack, outermost first: transport bar, then the Splits and
+                // Graphs drawers above it, with the map filling the rest.
                 self.playback_bar(ui);
+                self.splits_drawer(ui);
                 self.bottom_graphs(ui);
                 self.map_panel(ui);
             }
-            ViewTab::LegAnalysis => self.leg_analysis_panel(ui),
         }
         self.hover_km = self.pending_hover;
         self.hover_index = self.hover_km.and_then(|km| self.track_index_at_km(km));

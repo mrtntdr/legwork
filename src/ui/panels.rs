@@ -1,7 +1,6 @@
-use crate::analysis::{compare, fmt_duration, fmt_pace, leg_label, legs_between, quickness_color};
+use crate::analysis::{compare, fmt_duration, fmt_pace, leg_label, quickness_color};
 use crate::app::{App, EditMode, ViewTab};
 use egui::{Color32, RichText};
-use egui_extras::{Column, TableBuilder};
 
 /// Highlight color for the best (fastest) athlete in the leg summary.
 const BEST_GREEN: Color32 = Color32::from_rgb(80, 210, 120);
@@ -36,20 +35,17 @@ impl App {
         egui::Panel::top("top_bar").show(ui, |ui| {
             // A single horizontal row keeps the bar a fixed height (nested fill layouts
             // like columns/vertical_centered/justified make a top panel grow on hover).
-            // Groups: Open (left) · Tabs · Modes · Save/Export (right-aligned).
+            // Groups: File menu · the two activity tabs · Setup's edit modes.
             ui.horizontal(|ui| {
-                self.open_group(ui);
+                self.file_menu(ui);
                 ui.separator();
-                ui.selectable_value(&mut self.tab, ViewTab::Map, "Map");
-                ui.selectable_value(&mut self.tab, ViewTab::LegAnalysis, "Leg Analysis");
-                if self.tab == ViewTab::Map {
+                ui.selectable_value(&mut self.tab, ViewTab::Setup, "Setup");
+                ui.selectable_value(&mut self.tab, ViewTab::Analysis, "Analysis");
+                if self.tab == ViewTab::Setup {
                     ui.separator();
                     ui.selectable_value(&mut self.mode, EditMode::Calibrate, "Calibrate");
-                    ui.selectable_value(&mut self.mode, EditMode::Control, "Controls");
+                    ui.selectable_value(&mut self.mode, EditMode::Control, "Course");
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.save_group(ui);
-                });
             });
         });
 
@@ -60,20 +56,45 @@ impl App {
         });
     }
 
-    fn open_group(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Open Map…").clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Images", IMAGE_EXTS)
-                .pick_file()
-            && let Ok(bytes) = std::fs::read(&path)
-        {
-            let name = file_name(&path);
-            let ctx = ui.ctx().clone();
-            self.load_image_from_bytes(&ctx, bytes, name);
-        }
-        if ui.button("Add Track…").clicked() {
-            self.add_athlete_dialog();
-        }
+    /// All file operations in one place, so the top bar stays about the two
+    /// activities rather than a row of dialogs.
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            if ui.button("Open Map…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Images", IMAGE_EXTS)
+                    .pick_file()
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                let name = file_name(&path);
+                let ctx = ui.ctx().clone();
+                self.load_image_from_bytes(&ctx, bytes, name);
+            }
+            if ui.button("Add Track…").clicked() {
+                self.add_athlete_dialog();
+            }
+            ui.separator();
+            if ui.button("Open Project…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Legwork project", &["legit", "route"])
+                    .pick_file()
+            {
+                let ctx = ui.ctx().clone();
+                self.open_project(&ctx, path);
+            }
+            if ui.button("Save Project…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Legwork project", &["legit"])
+                    .set_file_name("analysis.legit")
+                    .save_file()
+            {
+                self.save_project(path);
+            }
+            ui.separator();
+            if ui.button("Export PNG…").clicked() {
+                self.export_png();
+            }
+        });
     }
 
     /// Pick a GPX/TCX file and add it as a new athlete.
@@ -88,82 +109,65 @@ impl App {
         }
     }
 
-    /// Save/export group, laid out right-to-left, so it reads Save · Open · Export.
-    fn save_group(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Export PNG…").clicked() {
-            self.export_png();
-        }
-        if ui.button("Open Project…").clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Legwork project", &["legit", "route"])
-                .pick_file()
-        {
-            let ctx = ui.ctx().clone();
-            self.open_project(&ctx, path);
-        }
-        if ui.button("Save Project…").clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Legwork project", &["legit"])
-                .set_file_name("analysis.legit")
-                .save_file()
-        {
-            self.save_project(path);
-        }
-    }
-
     pub(crate) fn side_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::right("side")
             .default_size(360.0)
-            .show(ui, |ui| {
-                self.athletes_section(ui);
-
-                // The comparison tab keeps only the athlete list; everything else
-                // (calibration, coloring, legs) belongs to the map view.
-                if self.tab == ViewTab::LegAnalysis {
-                    return;
-                }
-
-                ui.separator();
-                ui.heading("Track");
-                if let Some(a) = self.active() {
-                    ui.label(format!("Points: {}", a.track.len()));
-                    ui.label(format!(
-                        "Distance: {:.2} km",
-                        a.track.total_distance() / 1000.0
-                    ));
-                    if let Some(d) = a.track.duration_secs() {
-                        ui.label(format!("Duration: {}", fmt_duration(d)));
-                    }
-                } else {
-                    ui.label("No track loaded.");
-                }
-
-                // The calibration section is only relevant while calibrating.
-                if self.mode == EditMode::Calibrate {
-                    self.calibration_section(ui);
-                }
-
-                // Coloring and graph toggles belong to leg analysis (Controls mode).
-                if self.mode == EditMode::Control {
-                    self.coloring_controls(ui);
-
-                    ui.separator();
-                    ui.heading("Graphs");
-                    ui.checkbox(&mut self.show_pace, "Pace");
-                    ui.checkbox(&mut self.show_hr, "Heart rate");
-                    ui.checkbox(&mut self.show_ele, "Elevation");
-                }
-
-                self.leg_summary_section(ui);
-
-                ui.separator();
-                ui.heading("Controls");
-                if !self.controls.is_empty() && ui.button("Clear controls").clicked() {
-                    self.controls.clear();
-                    self.rematch_all();
-                }
-                self.legs_table(ui);
+            .show(ui, |ui| match self.tab {
+                ViewTab::Setup => self.setup_side_panel(ui),
+                ViewTab::Analysis => self.analysis_side_panel(ui),
             });
+    }
+
+    /// Setup: full athlete management, the active track's stats, and the details
+    /// of whichever edit mode is active (calibration or course).
+    fn setup_side_panel(&mut self, ui: &mut egui::Ui) {
+        self.athletes_section(ui, true);
+
+        ui.separator();
+        ui.heading("Track");
+        if let Some(a) = self.active() {
+            ui.label(format!("Points: {}", a.track.len()));
+            ui.label(format!(
+                "Distance: {:.2} km",
+                a.track.total_distance() / 1000.0
+            ));
+            if let Some(d) = a.track.duration_secs() {
+                ui.label(format!("Duration: {}", fmt_duration(d)));
+            }
+        } else {
+            ui.label("No track loaded.");
+        }
+
+        match self.mode {
+            EditMode::Calibrate => self.calibration_section(ui),
+            EditMode::Control => self.course_section(ui),
+        }
+    }
+
+    /// Analysis: a compact athlete list (visibility + active pick), route coloring,
+    /// and the selected-leg summary. No management, nothing that edits the project.
+    fn analysis_side_panel(&mut self, ui: &mut egui::Ui) {
+        self.athletes_section(ui, false);
+        self.coloring_controls(ui);
+        self.leg_summary_section(ui);
+    }
+
+    /// Course editing details (Setup · Course mode).
+    fn course_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Course");
+        ui.label(format!("Controls: {}", self.controls.len()));
+        if !self.controls.is_empty() && ui.button("Clear controls").clicked() {
+            self.controls.clear();
+            self.rematch_all();
+        }
+        ui.label(
+            egui::RichText::new(
+                "Click the map to place a control, drag to move it, right-click to remove.",
+            )
+            .weak()
+            .small(),
+        );
     }
 
     /// When a leg is selected on the map, a compact per-athlete summary for that
@@ -260,9 +264,10 @@ impl App {
         }
     }
 
-    /// The athlete list: color swatch, visibility, name (editable for the active
-    /// row), activation, and removal — plus Add and display options.
-    fn athletes_section(&mut self, ui: &mut egui::Ui) {
+    /// The athlete list. `full` (Setup) shows management — editable name, color
+    /// picker, remove, add. Compact (Analysis) is just color · visibility · pick
+    /// the active athlete.
+    fn athletes_section(&mut self, ui: &mut egui::Ui, full: bool) {
         ui.heading("Athletes");
         let mut remove: Option<usize> = None;
         let mut make_active: Option<usize> = None;
@@ -271,23 +276,25 @@ impl App {
             ui.horizontal(|ui| {
                 ui.color_edit_button_srgba(&mut a.color);
                 ui.checkbox(&mut a.visible, "").on_hover_text("Show route");
-                if i == active {
+                if full && i == active {
                     ui.add(
                         egui::TextEdit::singleline(&mut a.name)
                             .desired_width(ui.available_width() - 30.0),
                     );
                 } else if ui
-                    .selectable_label(false, &a.name)
+                    .selectable_label(i == active, &a.name)
                     .on_hover_text("Click to make active")
                     .clicked()
                 {
                     make_active = Some(i);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕").on_hover_text("Remove athlete").clicked() {
-                        remove = Some(i);
-                    }
-                });
+                if full {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").on_hover_text("Remove athlete").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
             });
         }
         if let Some(i) = make_active {
@@ -297,19 +304,21 @@ impl App {
             self.remove_athlete(i);
             self.status = "Removed athlete.".into();
         }
-        if ui.button("Add Athlete…").clicked() {
-            self.add_athlete_dialog();
-        }
-        if self.athletes.is_empty() {
-            ui.label(
-                egui::RichText::new("Add a GPS track to begin.")
-                    .weak()
-                    .small(),
-            );
-        } else {
+        if full {
+            if ui.button("Add Athlete…").clicked() {
+                self.add_athlete_dialog();
+            }
+            if self.athletes.is_empty() {
+                ui.label(
+                    egui::RichText::new("Add a GPS track to begin.")
+                        .weak()
+                        .small(),
+                );
+            }
+        } else if !self.athletes.is_empty() {
             ui.checkbox(&mut self.active_pace_colors, "Pace-color active route");
             ui.label(
-                egui::RichText::new("The active (named-field) athlete is calibrated and graphed.")
+                egui::RichText::new("The highlighted athlete drives graphs and pace colors.")
                     .weak()
                     .small(),
             );
@@ -522,73 +531,6 @@ impl App {
             .small()
             .weak(),
         );
-    }
-
-    fn legs_table(&mut self, ui: &mut egui::Ui) {
-        let Some(a) = self.active() else {
-            ui.label("Load a track to see legs.");
-            return;
-        };
-        let legs = legs_between(&a.track, &a.boundaries());
-        if legs.is_empty() {
-            ui.label("No legs yet.");
-            return;
-        }
-        TableBuilder::new(ui)
-            .striped(true)
-            .column(Column::exact(36.0))
-            .column(Column::exact(60.0))
-            .column(Column::exact(70.0))
-            .column(Column::exact(60.0))
-            .column(Column::remainder())
-            .header(18.0, |mut h| {
-                for label in ["Leg", "Time", "Length", "Detour", "Pace"] {
-                    h.col(|ui| {
-                        ui.strong(label);
-                    });
-                }
-            })
-            .body(|mut body| {
-                for (i, leg) in legs.iter().enumerate() {
-                    body.row(18.0, |mut row| {
-                        row.col(|ui| {
-                            ui.label(format!("{}", i + 1));
-                        });
-                        match leg {
-                            Some(leg) => {
-                                row.col(|ui| {
-                                    ui.label(
-                                        leg.duration_secs
-                                            .map(fmt_duration)
-                                            .unwrap_or_else(|| "–".into()),
-                                    );
-                                });
-                                row.col(|ui| {
-                                    ui.label(format!("{:.0} m", leg.route_length));
-                                });
-                                row.col(|ui| {
-                                    ui.label(format!("{:+.0}%", leg.detour_pct));
-                                });
-                                row.col(|ui| {
-                                    ui.label(
-                                        leg.pace_s_per_km
-                                            .map(fmt_pace)
-                                            .unwrap_or_else(|| "–".into()),
-                                    );
-                                });
-                            }
-                            // Missed control: the leg has no comparable measurements.
-                            None => {
-                                for _ in 0..4 {
-                                    row.col(|ui| {
-                                        ui.label("–");
-                                    });
-                                }
-                            }
-                        }
-                    });
-                }
-            });
     }
 }
 
