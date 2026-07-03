@@ -1,6 +1,6 @@
 # Legwork
 
-Orienteering analysis app in Rust inspired by QuickRoute and Livelox.
+Orienteering analysis app.
 
 Load a photo or scan of your map, drop one or more GPX/TCX tracks on top, georeference
 them by dragging a few route points onto matching map features, define the course, and
