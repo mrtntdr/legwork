@@ -1,9 +1,12 @@
-use crate::analysis::{MetricRange, auto_range, segment_metric};
+use crate::analysis::{
+    MetricRange, auto_range, local_scale_px_per_m, match_controls, segment_metric,
+};
+use crate::athlete::{ATHLETE_COLORS, Athlete};
 use crate::geo::{Correspondence, LocalProjection, MapTransform};
 use crate::io;
 use crate::io::ProjectBundle;
-use crate::model::{CalibrationPoint, Control, ProjectFile, Track, ViewState};
-use egui::{Pos2, TextureHandle, pos2};
+use crate::model::{AthleteFile, CoursePoint, ProjectFileV2, ViewState};
+use egui::{Color32, Pos2, TextureHandle, pos2};
 use std::path::PathBuf;
 
 /// A decoded map image plus its GPU texture and original encoded bytes.
@@ -11,6 +14,13 @@ pub struct MapImage {
     pub texture: TextureHandle,
     pub size: [usize; 2],
     pub bytes: Vec<u8>,
+}
+
+/// The top-level view: the map canvas or the leg-by-leg comparison.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewTab {
+    Map,
+    LegAnalysis,
 }
 
 /// What a canvas click/drag currently does. (Dragging empty space always pans.)
@@ -25,15 +35,25 @@ pub enum EditMode {
 pub enum DragTarget {
     View,
     Calibration(usize),
+    Control(usize),
 }
+
+/// Matching radius around a control, in meters on the ground.
+const MATCH_RADIUS_M: f64 = 60.0;
 
 pub struct App {
     // Loaded data
     pub(crate) map: Option<MapImage>,
-    pub(crate) track: Option<Track>,
+    pub(crate) athletes: Vec<Athlete>,
+    /// Index of the active athlete: the one being calibrated, graphed and
+    /// pace-colored. Route editing and the graphs always follow this athlete.
+    pub(crate) active: usize,
+    /// Shared local projection, anchored at the first loaded track's centroid so
+    /// every athlete's transform maps the same meter frame to image pixels (which
+    /// lets an uncalibrated athlete borrow a calibrated athlete's transform).
     pub(crate) proj: Option<LocalProjection>,
-    pub(crate) projected: Vec<(f64, f64)>,
-    pub(crate) seg_metric: Vec<f64>,
+    /// The shared course: controls placed on the map, in course order.
+    pub(crate) controls: Vec<CoursePoint>,
     pub(crate) metric_range: MetricRange,
     /// When true, the coloring range is auto-fit to the data; when false the user
     /// has set the fast/slow cutoffs manually.
@@ -46,17 +66,19 @@ pub struct App {
     /// to clip slow spikes (e.g. long map-reading pauses) and zoom into the real data.
     /// `None` fits the axis to all data.
     pub(crate) pace_cap_minkm: Option<f64>,
-    pub(crate) calibration: Vec<CalibrationPoint>,
-    pub(crate) controls: Vec<usize>,
-    pub(crate) transform: Option<MapTransform>,
 
     // View + interaction
+    pub(crate) tab: ViewTab,
     pub(crate) view: ViewState,
     pub(crate) mode: EditMode,
     pub(crate) drag: Option<DragTarget>,
     pub(crate) show_pace: bool,
     pub(crate) show_hr: bool,
     pub(crate) show_ele: bool,
+    /// Draw the active athlete's route with pace coloring instead of its solid color.
+    pub(crate) active_pace_colors: bool,
+    /// Show cumulative times in the leg comparison table.
+    pub(crate) show_cumulative: bool,
     pub(crate) fit_requested: bool,
 
     /// Cross-highlight between the graphs and the route: the along-track position
@@ -68,8 +90,6 @@ pub struct App {
 
     // Files
     pub(crate) image_name: String,
-    pub(crate) track_name: String,
-    pub(crate) track_bytes: Vec<u8>,
     pub(crate) project_path: Option<PathBuf>,
 
     // UI
@@ -80,33 +100,66 @@ impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             map: None,
-            track: None,
+            athletes: Vec::new(),
+            active: 0,
             proj: None,
-            projected: Vec::new(),
-            seg_metric: Vec::new(),
+            controls: Vec::new(),
             metric_range: MetricRange { min: 0.0, max: 1.0 },
             color_auto: true,
             palette_view: None,
             pace_cap_minkm: None,
-            calibration: Vec::new(),
-            controls: Vec::new(),
-            transform: None,
+            tab: ViewTab::Map,
             view: ViewState::default(),
             mode: EditMode::Calibrate,
             drag: None,
             show_pace: true,
             show_hr: true,
             show_ele: true,
+            active_pace_colors: true,
+            show_cumulative: true,
             fit_requested: false,
             hover_km: None,
             hover_index: None,
             pending_hover: None,
             image_name: String::new(),
-            track_name: String::new(),
-            track_bytes: Vec::new(),
             project_path: None,
-            status: "Open a map image and a GPS track to begin.".into(),
+            status: "Open a map image and add a GPS track to begin.".into(),
         }
+    }
+
+    // --- Athletes --------------------------------------------------------------
+
+    pub(crate) fn active(&self) -> Option<&Athlete> {
+        self.athletes.get(self.active)
+    }
+
+    pub(crate) fn active_mut(&mut self) -> Option<&mut Athlete> {
+        self.athletes.get_mut(self.active)
+    }
+
+    pub(crate) fn set_active(&mut self, i: usize) {
+        if i < self.athletes.len() && i != self.active {
+            self.active = i;
+            self.recompute_metric_active();
+        }
+    }
+
+    pub(crate) fn remove_athlete(&mut self, i: usize) {
+        if i >= self.athletes.len() {
+            return;
+        }
+        self.athletes.remove(i);
+        if self.active > i {
+            self.active -= 1;
+        }
+        if self.active >= self.athletes.len() {
+            self.active = self.athletes.len().saturating_sub(1);
+        }
+        if self.athletes.is_empty() {
+            // The next track re-anchors the shared projection.
+            self.proj = None;
+        }
+        self.recompute_metric_active();
     }
 
     // --- Loading -------------------------------------------------------------
@@ -129,60 +182,68 @@ impl App {
                 });
                 self.image_name = name;
                 self.fit_requested = true;
-                self.recompute_transform();
+                self.recompute_all_transforms();
                 self.status = format!("Loaded map ({w}x{h}).");
             }
             Err(e) => self.status = e,
         }
     }
 
-    pub(crate) fn load_track_from_bytes(&mut self, bytes: Vec<u8>, name: String) {
+    /// Parse a track file and add it as a new athlete (named after the file).
+    pub(crate) fn add_athlete(&mut self, bytes: Vec<u8>, file_name: String) {
         match io::parse_track(&bytes) {
             Ok(track) => {
-                self.track_bytes = bytes;
-                self.track_name = name;
+                if self.proj.is_none() {
+                    self.proj = track
+                        .centroid()
+                        .map(|(la, lo)| LocalProjection::new(la, lo));
+                }
+                let projected = match &self.proj {
+                    Some(p) => track
+                        .points
+                        .iter()
+                        .map(|w| p.project(w.lat, w.lon))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let name = match file_name.rsplit_once('.') {
+                    Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+                    _ => file_name.clone(),
+                };
                 self.status = format!(
-                    "Loaded track: {} points, {:.2} km.",
+                    "Added {name}: {} points, {:.2} km.",
                     track.len(),
                     track.total_distance() / 1000.0
                 );
-                self.set_track(track);
+                let seg_metric = segment_metric(&track);
+                self.athletes.push(Athlete {
+                    name,
+                    color: ATHLETE_COLORS[self.athletes.len() % ATHLETE_COLORS.len()],
+                    visible: true,
+                    track,
+                    track_name: file_name,
+                    track_bytes: bytes,
+                    projected,
+                    seg_metric,
+                    calibration: Vec::new(),
+                    transform: None,
+                    matched: Vec::new(),
+                });
+                self.active = self.athletes.len() - 1;
+                self.recompute_transform_at(self.active);
+                self.recompute_metric_active();
             }
             Err(e) => self.status = e,
         }
     }
 
-    fn set_track(&mut self, track: Track) {
-        self.proj = track
-            .centroid()
-            .map(|(la, lo)| LocalProjection::new(la, lo));
-        self.projected = match &self.proj {
-            Some(p) => track
-                .points
-                .iter()
-                .map(|w| p.project(w.lat, w.lon))
-                .collect(),
-            None => Vec::new(),
-        };
-        self.calibration.clear();
-        self.controls.clear();
-        self.pace_cap_minkm = None;
-        self.recompute_metric(&track);
-        self.track = Some(track);
-        self.recompute_transform();
-    }
-
-    pub(crate) fn recompute_metric_current(&mut self) {
-        if let Some(track) = self.track.take() {
-            self.recompute_metric(&track);
-            self.track = Some(track);
-        }
-    }
-
-    fn recompute_metric(&mut self, track: &Track) {
-        self.seg_metric = segment_metric(track);
-        if self.color_auto {
-            self.metric_range = auto_range(&self.seg_metric);
+    /// Refit the auto color range to the active athlete (manual cutoffs persist).
+    pub(crate) fn recompute_metric_active(&mut self) {
+        if let Some(a) = self.athletes.get_mut(self.active) {
+            a.seg_metric = segment_metric(&a.track);
+            if self.color_auto {
+                self.metric_range = auto_range(&a.seg_metric);
+            }
         }
     }
 
@@ -204,52 +265,87 @@ impl App {
 
     // --- Georeferencing ------------------------------------------------------
 
-    /// Rebuild the meters->pixels transform from the locked calibration points so
-    /// each one is honored exactly: 0 -> bounding-box overlay, 1 -> translation,
-    /// 2 -> similarity, 3+ -> interpolating TPS.
-    pub(crate) fn recompute_transform(&mut self) {
-        if self.track.is_none() {
-            self.transform = None;
-            return;
+    pub(crate) fn recompute_transform_active(&mut self) {
+        self.recompute_transform_at(self.active);
+    }
+
+    /// Rebuild athlete `i`'s meters->pixels transform from their locked calibration
+    /// points so each one is honored exactly: 0 -> fallback (borrowed or bounding-box
+    /// overlay), 1 -> translation on the fallback, 2 -> similarity, 3+ -> TPS.
+    pub(crate) fn recompute_transform_at(&mut self, i: usize) {
+        let t = self.compute_transform(i);
+        if let Some(a) = self.athletes.get_mut(i) {
+            a.transform = t;
         }
-        let pts: Vec<Correspondence> = self
+        self.rematch_athlete(i);
+    }
+
+    /// Recompute every athlete's transform, best-calibrated first so uncalibrated
+    /// athletes can borrow a fresh transform.
+    pub(crate) fn recompute_all_transforms(&mut self) {
+        let mut order: Vec<usize> = (0..self.athletes.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.athletes[i].calibration.len()));
+        for i in order {
+            self.recompute_transform_at(i);
+        }
+    }
+
+    fn compute_transform(&self, i: usize) -> Option<MapTransform> {
+        let a = self.athletes.get(i)?;
+        let pts: Vec<Correspondence> = a
             .calibration
             .iter()
             .filter_map(|c| {
-                self.projected
+                a.projected
                     .get(c.track_index)
                     .map(|&m| (m, (c.image_px[0], c.image_px[1])))
             })
             .collect();
 
-        self.transform = match pts.len() {
-            0 => self.initial_transform(),
-            1 => self.translation_transform(pts[0]),
-            _ => MapTransform::fit(&pts).or_else(|| self.initial_transform()),
-        };
+        match pts.len() {
+            0 => self.fallback_transform(i),
+            1 => self.translation_transform(i, pts[0]),
+            _ => MapTransform::fit(&pts).or_else(|| self.fallback_transform(i)),
+        }
     }
 
-    /// Keep the initial overlay's scale/rotation but shift it so the single locked
-    /// point lands exactly on its map feature.
-    fn translation_transform(&self, (meters, px): Correspondence) -> Option<MapTransform> {
-        let base = self.initial_transform()?;
-        let MapTransform::Matrix(mut m) = base else {
-            return Some(base);
-        };
-        let mapped = MapTransform::Matrix(m).apply(meters);
-        m[(0, 2)] += px.0 - mapped.0;
-        m[(1, 2)] += px.1 - mapped.1;
-        Some(MapTransform::Matrix(m))
+    /// Base transform for an athlete with no usable fit of their own: borrow the
+    /// transform of the best-calibrated other athlete (all transforms share one
+    /// meter frame), else fit this athlete's bounding box into the map.
+    fn fallback_transform(&self, i: usize) -> Option<MapTransform> {
+        self.athletes
+            .iter()
+            .enumerate()
+            .filter(|&(j, a)| j != i && !a.calibration.is_empty() && a.transform.is_some())
+            .max_by_key(|&(_, a)| a.calibration.len())
+            .and_then(|(_, a)| a.transform.clone())
+            .or_else(|| self.initial_transform(&self.athletes.get(i)?.projected))
+    }
+
+    /// Keep the fallback's scale/rotation but shift it so the single locked point
+    /// lands exactly on its map feature.
+    fn translation_transform(&self, i: usize, (meters, px): Correspondence) -> Option<MapTransform> {
+        let base = self.fallback_transform(i)?;
+        let mapped = base.apply(meters);
+        let d = [px.0 - mapped.0, px.1 - mapped.1];
+        Some(match base {
+            MapTransform::Matrix(mut m) => {
+                m[(0, 2)] += d[0];
+                m[(1, 2)] += d[1];
+                MapTransform::Matrix(m)
+            }
+            other => MapTransform::Translated(Box::new(other), d),
+        })
     }
 
     /// A no-calibration starting overlay: fit the track's bounding box into the
     /// map image (north up) so the route is visible and ready to be pinned.
-    fn initial_transform(&self) -> Option<MapTransform> {
+    fn initial_transform(&self, projected: &[(f64, f64)]) -> Option<MapTransform> {
         let map = self.map.as_ref()?;
-        if self.projected.is_empty() {
+        if projected.is_empty() {
             return None;
         }
-        let (minx, maxx, miny, maxy) = self.projected.iter().fold(
+        let (minx, maxx, miny, maxy) = projected.iter().fold(
             (f64::MAX, f64::MIN, f64::MAX, f64::MIN),
             |(minx, maxx, miny, maxy), &(x, y)| {
                 (minx.min(x), maxx.max(x), miny.min(y), maxy.max(y))
@@ -277,6 +373,39 @@ impl App {
         )))
     }
 
+    // --- Control matching ------------------------------------------------------
+
+    /// Re-resolve which of athlete `i`'s waypoints passes each shared control.
+    pub(crate) fn rematch_athlete(&mut self, i: usize) {
+        let matched = match self.athletes.get(i) {
+            Some(a) if !self.controls.is_empty() && a.transform.is_some() => {
+                let t = a.transform.as_ref().unwrap();
+                let route_px: Vec<(f64, f64)> =
+                    a.projected.iter().map(|&m| t.apply(m)).collect();
+                // Scale-aware radius, evaluated mid-route so a zoomed-in photo and a
+                // whole-map scan both get a sensible on-the-ground tolerance.
+                let mid = a.projected.get(a.projected.len() / 2).copied();
+                let radius = mid
+                    .map(|m| (MATCH_RADIUS_M * local_scale_px_per_m(t, m)).clamp(20.0, 300.0))
+                    .unwrap_or(60.0);
+                let controls: Vec<[f64; 2]> = self.controls.iter().map(|c| c.image_px).collect();
+                match_controls(&route_px, &controls, radius)
+            }
+            Some(_) => vec![None; self.controls.len()],
+            None => return,
+        };
+        if let Some(a) = self.athletes.get_mut(i) {
+            a.matched = matched;
+        }
+    }
+
+    /// Re-resolve control matches for every athlete (after any course edit).
+    pub(crate) fn rematch_all(&mut self) {
+        for i in 0..self.athletes.len() {
+            self.rematch_athlete(i);
+        }
+    }
+
     // --- Coordinate helpers --------------------------------------------------
 
     pub(crate) fn to_screen(&self, origin: Pos2, img: (f64, f64)) -> Pos2 {
@@ -293,16 +422,17 @@ impl App {
         )
     }
 
-    /// Screen position of waypoint `i`, if a transform exists.
+    /// Screen position of the active athlete's waypoint `i`, if a transform exists.
     pub(crate) fn waypoint_screen(&self, origin: Pos2, i: usize) -> Option<Pos2> {
-        let t = self.transform.as_ref()?;
-        let m = *self.projected.get(i)?;
+        let a = self.active()?;
+        let t = a.transform.as_ref()?;
+        let m = *a.projected.get(i)?;
         Some(self.to_screen(origin, t.apply(m)))
     }
 
-    /// Waypoint index nearest a given along-track distance (km).
+    /// Active athlete's waypoint index nearest a given along-track distance (km).
     pub(crate) fn track_index_at_km(&self, km: f64) -> Option<usize> {
-        let track = self.track.as_ref()?;
+        let track = &self.active()?.track;
         if track.is_empty() {
             return None;
         }
@@ -315,16 +445,17 @@ impl App {
             .map(|(i, _)| i)
     }
 
-    /// Along-track distance (km) at a waypoint index.
+    /// Along-track distance (km) at an active-athlete waypoint index.
     pub(crate) fn km_at_index(&self, i: usize) -> Option<f64> {
-        let track = self.track.as_ref()?;
+        let track = &self.active()?.track;
         track.cumulative_distance().get(i).map(|&d| d / 1000.0)
     }
 
-    /// Index of the route waypoint nearest to a screen point (within reason).
+    /// Index of the active athlete's waypoint nearest to a screen point.
     pub(crate) fn nearest_waypoint(&self, origin: Pos2, p: Pos2) -> Option<usize> {
-        let t = self.transform.as_ref()?;
-        self.projected
+        let a = self.active()?;
+        let t = a.transform.as_ref()?;
+        a.projected
             .iter()
             .enumerate()
             .map(|(i, &m)| {
@@ -337,16 +468,25 @@ impl App {
 
     // --- Persistence ---------------------------------------------------------
 
-    pub(crate) fn to_project_file(&self) -> ProjectFile {
-        ProjectFile {
+    pub(crate) fn to_project_file(&self) -> ProjectFileV2 {
+        ProjectFileV2 {
+            version: 2,
             image_name: self.image_name.clone(),
-            track_name: self.track_name.clone(),
-            calibration: self.calibration.clone(),
-            controls: self
-                .controls
+            athletes: self
+                .athletes
                 .iter()
-                .map(|&track_index| Control { track_index })
+                .enumerate()
+                .map(|(i, a)| AthleteFile {
+                    name: a.name.clone(),
+                    color: [a.color.r(), a.color.g(), a.color.b()],
+                    visible: a.visible,
+                    // Per-athlete folders keep same-named track files from colliding.
+                    track_entry: format!("tracks/{i}/{}", a.track_name),
+                    calibration: a.calibration.clone(),
+                })
                 .collect(),
+            controls: self.controls.clone(),
+            active: self.active,
             view: self.view,
         }
     }
@@ -359,7 +499,8 @@ impl App {
         let bundle = ProjectBundle {
             project: self.to_project_file(),
             image_bytes: map.bytes.clone(),
-            track_bytes: self.track_bytes.clone(),
+            tracks: self.athletes.iter().map(|a| a.track_bytes.clone()).collect(),
+            legacy_control_indices: None,
         };
         match io::write_bundle(&bundle)
             .and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string()))
@@ -387,19 +528,55 @@ impl App {
                 return;
             }
         };
-        self.load_track_from_bytes(bundle.track_bytes, bundle.project.track_name.clone());
-        self.load_image_from_bytes(ctx, bundle.image_bytes, bundle.project.image_name.clone());
-        self.calibration = bundle.project.calibration;
-        self.controls = bundle
-            .project
-            .controls
-            .iter()
-            .map(|c| c.track_index)
-            .collect();
-        self.view = bundle.project.view;
+        let project = bundle.project;
+
+        self.athletes.clear();
+        self.proj = None;
+        self.controls.clear();
+        self.load_image_from_bytes(ctx, bundle.image_bytes, project.image_name.clone());
+        for (meta, track_bytes) in project.athletes.into_iter().zip(bundle.tracks) {
+            let file_name = meta
+                .track_entry
+                .rsplit('/')
+                .next()
+                .unwrap_or(&meta.track_entry)
+                .to_string();
+            let before = self.athletes.len();
+            self.add_athlete(track_bytes, file_name);
+            if self.athletes.len() > before
+                && let Some(a) = self.athletes.last_mut()
+            {
+                a.name = meta.name;
+                a.color = Color32::from_rgb(meta.color[0], meta.color[1], meta.color[2]);
+                a.visible = meta.visible;
+                a.calibration = meta.calibration;
+            }
+        }
+        self.active = project
+            .active
+            .min(self.athletes.len().saturating_sub(1));
+        self.controls = project.controls;
+        self.recompute_all_transforms();
+
+        // V1 controls were waypoint indices into the single track; place them on the
+        // map exactly where the old renderer drew them (through the track's transform).
+        if let Some(indices) = bundle.legacy_control_indices
+            && let Some(a) = self.athletes.first()
+            && let Some(t) = &a.transform
+        {
+            self.controls = indices
+                .iter()
+                .filter_map(|&i| a.projected.get(i))
+                .map(|&m| {
+                    let (x, y) = t.apply(m);
+                    CoursePoint { image_px: [x, y] }
+                })
+                .collect();
+        }
+        self.rematch_all();
+        self.recompute_metric_active();
+        self.view = project.view;
         self.fit_requested = false;
-        self.recompute_metric_current();
-        self.recompute_transform();
         self.project_path = Some(path);
         self.status = "Project opened.".into();
     }
@@ -412,8 +589,13 @@ impl eframe::App for App {
         self.pending_hover = None;
         self.top_bar(ui);
         self.side_panel(ui);
-        self.bottom_graphs(ui);
-        self.map_panel(ui);
+        match self.tab {
+            ViewTab::Map => {
+                self.bottom_graphs(ui);
+                self.map_panel(ui);
+            }
+            ViewTab::LegAnalysis => self.leg_analysis_panel(ui),
+        }
         self.hover_km = self.pending_hover;
         self.hover_index = self.hover_km.and_then(|km| self.track_index_at_km(km));
         if self.hover_km.is_some() {

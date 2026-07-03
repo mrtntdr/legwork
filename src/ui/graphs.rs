@@ -1,4 +1,4 @@
-use crate::analysis::{control_indices, fmt_duration, fmt_pace, quickness_color};
+use crate::analysis::{fmt_duration, fmt_pace, quickness_color};
 use crate::app::{App, EditMode};
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
 
@@ -95,8 +95,10 @@ impl App {
         }
     }
 
+    /// Snapshot the active athlete's data for the graphs.
     fn build_graph_data(&self) -> Option<GraphData> {
-        let track = self.track.as_ref()?;
+        let athlete = self.active()?;
+        let track = &athlete.track;
         let cum = track.cumulative_distance();
         let speeds = track.segment_speeds();
 
@@ -130,9 +132,12 @@ impl App {
             .filter_map(|(i, w)| w.ele.map(|e| (cum[i] / 1000.0, e)))
             .collect();
 
-        let marks = control_indices(track, &self.controls)
+        // Vertical marks at the athlete's matched leg boundaries (start, matched
+        // controls, finish); unmatched controls simply have no mark.
+        let marks = athlete
+            .boundaries()
             .iter()
-            .filter_map(|&i| cum.get(i).map(|&d| d / 1000.0))
+            .filter_map(|b| b.and_then(|i| cum.get(i)).map(|&d| d / 1000.0))
             .collect();
 
         Some(GraphData {

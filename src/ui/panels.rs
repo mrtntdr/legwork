@@ -1,5 +1,5 @@
-use crate::analysis::{fmt_duration, fmt_pace, legs, quickness_color};
-use crate::app::{App, EditMode};
+use crate::analysis::{fmt_duration, fmt_pace, legs_between, quickness_color};
+use crate::app::{App, EditMode, ViewTab};
 use egui_extras::{Column, TableBuilder};
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "tiff", "tif", "bmp", "webp"];
@@ -32,12 +32,17 @@ impl App {
         egui::Panel::top("top_bar").show(ui, |ui| {
             // A single horizontal row keeps the bar a fixed height (nested fill layouts
             // like columns/vertical_centered/justified make a top panel grow on hover).
-            // Groups: Open (left) · Modes · Save/Export (right-aligned).
+            // Groups: Open (left) · Tabs · Modes · Save/Export (right-aligned).
             ui.horizontal(|ui| {
                 self.open_group(ui);
                 ui.separator();
-                ui.selectable_value(&mut self.mode, EditMode::Calibrate, "Calibrate");
-                ui.selectable_value(&mut self.mode, EditMode::Control, "Controls");
+                ui.selectable_value(&mut self.tab, ViewTab::Map, "Map");
+                ui.selectable_value(&mut self.tab, ViewTab::LegAnalysis, "Leg Analysis");
+                if self.tab == ViewTab::Map {
+                    ui.separator();
+                    ui.selectable_value(&mut self.mode, EditMode::Calibrate, "Calibrate");
+                    ui.selectable_value(&mut self.mode, EditMode::Control, "Controls");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.save_group(ui);
                 });
@@ -62,14 +67,20 @@ impl App {
             let ctx = ui.ctx().clone();
             self.load_image_from_bytes(&ctx, bytes, name);
         }
-        if ui.button("Open Track…").clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("GPX/TCX", TRACK_EXTS)
-                .pick_file()
+        if ui.button("Add Track…").clicked() {
+            self.add_athlete_dialog();
+        }
+    }
+
+    /// Pick a GPX/TCX file and add it as a new athlete.
+    fn add_athlete_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("GPX/TCX", TRACK_EXTS)
+            .pick_file()
             && let Ok(bytes) = std::fs::read(&path)
         {
             let name = file_name(&path);
-            self.load_track_from_bytes(bytes, name);
+            self.add_athlete(bytes, name);
         }
     }
 
@@ -100,14 +111,23 @@ impl App {
         egui::Panel::right("side")
             .default_size(360.0)
             .show(ui, |ui| {
+                self.athletes_section(ui);
+
+                // The comparison tab keeps only the athlete list; everything else
+                // (calibration, coloring, legs) belongs to the map view.
+                if self.tab == ViewTab::LegAnalysis {
+                    return;
+                }
+
+                ui.separator();
                 ui.heading("Track");
-                if let Some(track) = &self.track {
-                    ui.label(format!("Points: {}", track.len()));
+                if let Some(a) = self.active() {
+                    ui.label(format!("Points: {}", a.track.len()));
                     ui.label(format!(
                         "Distance: {:.2} km",
-                        track.total_distance() / 1000.0
+                        a.track.total_distance() / 1000.0
                     ));
-                    if let Some(d) = track.duration_secs() {
+                    if let Some(d) = a.track.duration_secs() {
                         ui.label(format!("Duration: {}", fmt_duration(d)));
                     }
                 } else {
@@ -116,47 +136,7 @@ impl App {
 
                 // The calibration section is only relevant while calibrating.
                 if self.mode == EditMode::Calibrate {
-                    ui.separator();
-                    ui.heading("Calibration");
-                    ui.label(format!("Points: {}", self.calibration.len()));
-                    if let (Some(t), true) = (&self.transform, self.calibration.len() >= 2) {
-                        let pts: Vec<_> = self
-                            .calibration
-                            .iter()
-                            .filter_map(|c| {
-                                self.projected
-                                    .get(c.track_index)
-                                    .map(|&m| (m, (c.image_px[0], c.image_px[1])))
-                            })
-                            .collect();
-                        ui.label(format!("Fit residual: {:.1} px", t.rms_residual(&pts)));
-                    } else {
-                        ui.label("Add ≥2 points (Calibrate mode) to fit.");
-                    }
-                    // Per-point removal (also: right-click a marker, or Ctrl/Cmd+Z to undo).
-                    let mut remove: Option<usize> = None;
-                    for i in 0..self.calibration.len() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("L{}", i + 1));
-                            if ui.button("Remove").clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    }
-                    if let Some(i) = remove {
-                        self.calibration.remove(i);
-                        self.recompute_transform();
-                        self.status = "Removed calibration point.".into();
-                    }
-                    if !self.calibration.is_empty() && ui.button("Clear calibration").clicked() {
-                        self.calibration.clear();
-                        self.recompute_transform();
-                    }
-                    ui.label(
-                        egui::RichText::new("Right-click a marker or Ctrl/Cmd+Z to remove.")
-                            .weak()
-                            .small(),
-                    );
+                    self.calibration_section(ui);
                 }
 
                 // Coloring and graph toggles belong to leg analysis (Controls mode).
@@ -174,9 +154,119 @@ impl App {
                 ui.heading("Controls");
                 if !self.controls.is_empty() && ui.button("Clear controls").clicked() {
                     self.controls.clear();
+                    self.rematch_all();
                 }
                 self.legs_table(ui);
             });
+    }
+
+    /// The athlete list: color swatch, visibility, name (editable for the active
+    /// row), activation, and removal — plus Add and display options.
+    fn athletes_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Athletes");
+        let mut remove: Option<usize> = None;
+        let mut make_active: Option<usize> = None;
+        let active = self.active;
+        for (i, a) in self.athletes.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgba(&mut a.color);
+                ui.checkbox(&mut a.visible, "").on_hover_text("Show route");
+                if i == active {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut a.name)
+                            .desired_width(ui.available_width() - 30.0),
+                    );
+                } else if ui
+                    .selectable_label(false, &a.name)
+                    .on_hover_text("Click to make active")
+                    .clicked()
+                {
+                    make_active = Some(i);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✕").on_hover_text("Remove athlete").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            });
+        }
+        if let Some(i) = make_active {
+            self.set_active(i);
+        }
+        if let Some(i) = remove {
+            self.remove_athlete(i);
+            self.status = "Removed athlete.".into();
+        }
+        if ui.button("Add Athlete…").clicked() {
+            self.add_athlete_dialog();
+        }
+        if self.athletes.is_empty() {
+            ui.label(
+                egui::RichText::new("Add a GPS track to begin.")
+                    .weak()
+                    .small(),
+            );
+        } else {
+            ui.checkbox(&mut self.active_pace_colors, "Pace-color active route");
+            ui.label(
+                egui::RichText::new("The active (named-field) athlete is calibrated and graphed.")
+                    .weak()
+                    .small(),
+            );
+        }
+    }
+
+    fn calibration_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Calibration");
+        let Some(a) = self.active() else {
+            ui.label("Add a track to calibrate.");
+            return;
+        };
+        ui.label(format!("Points: {}", a.calibration.len()));
+        if let (Some(t), true) = (&a.transform, a.calibration.len() >= 2) {
+            let pts: Vec<_> = a
+                .calibration
+                .iter()
+                .filter_map(|c| {
+                    a.projected
+                        .get(c.track_index)
+                        .map(|&m| (m, (c.image_px[0], c.image_px[1])))
+                })
+                .collect();
+            ui.label(format!("Fit residual: {:.1} px", t.rms_residual(&pts)));
+        } else {
+            ui.label("Add ≥2 points (Calibrate mode) to fit.");
+        }
+        // Per-point removal (also: right-click a marker, or Ctrl/Cmd+Z to undo).
+        let n_points = a.calibration.len();
+        let mut remove: Option<usize> = None;
+        for i in 0..n_points {
+            ui.horizontal(|ui| {
+                ui.label(format!("L{}", i + 1));
+                if ui.button("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            if let Some(a) = self.active_mut() {
+                a.calibration.remove(i);
+            }
+            self.recompute_transform_active();
+            self.status = "Removed calibration point.".into();
+        }
+        if n_points > 0 && ui.button("Clear calibration").clicked() {
+            if let Some(a) = self.active_mut() {
+                a.calibration.clear();
+            }
+            self.recompute_transform_active();
+        }
+        ui.label(
+            egui::RichText::new("Right-click a marker or Ctrl/Cmd+Z to remove.")
+                .weak()
+                .small(),
+        );
     }
 
     /// Route coloring controls: an interactive pace/color palette whose two handles
@@ -193,7 +283,7 @@ impl App {
         {
             self.color_auto = auto;
             if auto {
-                self.recompute_metric_current();
+                self.recompute_metric_active();
             }
         }
 
@@ -335,11 +425,11 @@ impl App {
     }
 
     fn legs_table(&mut self, ui: &mut egui::Ui) {
-        let Some(track) = &self.track else {
+        let Some(a) = self.active() else {
             ui.label("Load a track to see legs.");
             return;
         };
-        let legs = legs(track, &self.controls);
+        let legs = legs_between(&a.track, &a.boundaries());
         if legs.is_empty() {
             ui.label("No legs yet.");
             return;
@@ -364,26 +454,38 @@ impl App {
                         row.col(|ui| {
                             ui.label(format!("{}", i + 1));
                         });
-                        row.col(|ui| {
-                            ui.label(
-                                leg.duration_secs
-                                    .map(fmt_duration)
-                                    .unwrap_or_else(|| "–".into()),
-                            );
-                        });
-                        row.col(|ui| {
-                            ui.label(format!("{:.0} m", leg.route_length));
-                        });
-                        row.col(|ui| {
-                            ui.label(format!("{:+.0}%", leg.detour_pct));
-                        });
-                        row.col(|ui| {
-                            ui.label(
-                                leg.pace_s_per_km
-                                    .map(fmt_pace)
-                                    .unwrap_or_else(|| "–".into()),
-                            );
-                        });
+                        match leg {
+                            Some(leg) => {
+                                row.col(|ui| {
+                                    ui.label(
+                                        leg.duration_secs
+                                            .map(fmt_duration)
+                                            .unwrap_or_else(|| "–".into()),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.label(format!("{:.0} m", leg.route_length));
+                                });
+                                row.col(|ui| {
+                                    ui.label(format!("{:+.0}%", leg.detour_pct));
+                                });
+                                row.col(|ui| {
+                                    ui.label(
+                                        leg.pace_s_per_km
+                                            .map(fmt_pace)
+                                            .unwrap_or_else(|| "–".into()),
+                                    );
+                                });
+                            }
+                            // Missed control: the leg has no comparable measurements.
+                            None => {
+                                for _ in 0..4 {
+                                    row.col(|ui| {
+                                        ui.label("–");
+                                    });
+                                }
+                            }
+                        }
                     });
                 }
             });

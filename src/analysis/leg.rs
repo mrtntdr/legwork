@@ -18,56 +18,49 @@ pub struct Leg {
     pub pace_s_per_km: Option<f64>,
 }
 
-/// Build the ordered list of control indices from the placed controls.
-/// Always includes the track start and finish as implicit controls.
-pub fn control_indices(track: &Track, controls: &[usize]) -> Vec<usize> {
-    if track.is_empty() {
-        return Vec::new();
-    }
-    let last = track.len() - 1;
-    let mut idx: Vec<usize> = std::iter::once(0)
-        .chain(controls.iter().copied())
-        .chain(std::iter::once(last))
-        .filter(|&i| i <= last)
-        .collect();
-    idx.sort_unstable();
-    idx.dedup();
-    idx
-}
-
-/// Compute per-leg metrics for the given controls.
-pub fn legs(track: &Track, controls: &[usize]) -> Vec<Leg> {
-    let controls = control_indices(track, controls);
-    controls
+/// Per-leg metrics between consecutive boundaries (start, matched controls…,
+/// finish). One entry per consecutive pair; `None` where either endpoint is
+/// unmatched or out of order.
+pub fn legs_between(track: &Track, boundaries: &[Option<usize>]) -> Vec<Option<Leg>> {
+    boundaries
         .windows(2)
         .map(|w| {
-            let (a, b) = (w[0], w[1]);
-            let route_length = track.route_length(a, b);
-            let straight = track.straight_distance(a, b);
-            let detour_pct = if straight > 1e-6 {
-                (route_length / straight - 1.0) * 100.0
-            } else {
-                0.0
+            let (Some(a), Some(b)) = (w[0], w[1]) else {
+                return None;
             };
-            let duration = track.duration_between(a, b);
-            let pace = duration.and_then(|d| {
-                if route_length > 1.0 {
-                    Some(d / (route_length / 1000.0))
-                } else {
-                    None
-                }
-            });
-            Leg {
-                from_index: a,
-                to_index: b,
-                duration_secs: duration,
-                route_length,
-                straight_distance: straight,
-                detour_pct,
-                pace_s_per_km: pace,
+            if a > b || b >= track.len() {
+                return None;
             }
+            Some(make_leg(track, a, b))
         })
         .collect()
+}
+
+fn make_leg(track: &Track, a: usize, b: usize) -> Leg {
+    let route_length = track.route_length(a, b);
+    let straight = track.straight_distance(a, b);
+    let detour_pct = if straight > 1e-6 {
+        (route_length / straight - 1.0) * 100.0
+    } else {
+        0.0
+    };
+    let duration = track.duration_between(a, b);
+    let pace = duration.and_then(|d| {
+        if route_length > 1.0 {
+            Some(d / (route_length / 1000.0))
+        } else {
+            None
+        }
+    });
+    Leg {
+        from_index: a,
+        to_index: b,
+        duration_secs: duration,
+        route_length,
+        straight_distance: straight,
+        detour_pct,
+        pace_s_per_km: pace,
+    }
 }
 
 /// Format seconds as `m:ss` (or `h:mm:ss`).
@@ -107,6 +100,11 @@ mod tests {
         }
     }
 
+    /// Boundaries spanning the whole track with no controls in between.
+    fn full(track: &Track) -> Vec<Option<usize>> {
+        vec![Some(0), Some(track.len() - 1)]
+    }
+
     #[test]
     fn straight_leg_has_zero_detour() {
         // Three collinear points along a meridian.
@@ -117,14 +115,11 @@ mod tests {
                 wp(59.002, 18.0, 60),
             ],
         };
-        let legs = legs(&track, &[]);
+        let legs = legs_between(&track, &full(&track));
         assert_eq!(legs.len(), 1);
-        assert!(
-            legs[0].detour_pct.abs() < 0.5,
-            "detour {}",
-            legs[0].detour_pct
-        );
-        assert_eq!(legs[0].duration_secs, Some(60.0));
+        let leg = legs[0].as_ref().unwrap();
+        assert!(leg.detour_pct.abs() < 0.5, "detour {}", leg.detour_pct);
+        assert_eq!(leg.duration_secs, Some(60.0));
     }
 
     #[test]
@@ -136,23 +131,37 @@ mod tests {
                 wp(59.002, 18.0, 60),
             ],
         };
-        let legs = legs(&track, &[1]);
+        let legs = legs_between(&track, &[Some(0), Some(1), Some(2)]);
         assert_eq!(legs.len(), 2);
+        assert!(legs.iter().all(Option::is_some));
     }
 
     #[test]
-    fn control_indices_include_endpoints_sorted_and_deduped() {
+    fn unmatched_boundaries_blank_adjacent_legs_only() {
         let track = Track {
             points: (0..5i64)
                 .map(|i| wp(59.0 + i as f64 * 0.001, 18.0, i * 10))
                 .collect(),
         };
-        // Unsorted, duplicated, and including the implicit endpoints.
-        assert_eq!(control_indices(&track, &[3, 1, 3, 0, 4]), vec![0, 1, 3, 4]);
-        // Out-of-range controls are dropped.
-        assert_eq!(control_indices(&track, &[99]), vec![0, 4]);
-        // Empty track yields no controls at all.
-        assert!(control_indices(&Track::default(), &[1]).is_empty());
+        // Middle control unmatched: legs 1 and 2 are None, leg 3 survives.
+        let legs = legs_between(&track, &[Some(0), Some(1), None, Some(3), Some(4)]);
+        assert_eq!(legs.len(), 4);
+        assert!(legs[0].is_some());
+        assert!(legs[1].is_none());
+        assert!(legs[2].is_none());
+        assert!(legs[3].is_some());
+    }
+
+    #[test]
+    fn out_of_order_or_out_of_range_boundaries_yield_no_leg() {
+        let track = Track {
+            points: vec![wp(59.0, 18.0, 0), wp(59.001, 18.0, 30)],
+        };
+        let reversed = legs_between(&track, &[Some(1), Some(0)]);
+        assert_eq!(reversed.len(), 1);
+        assert!(reversed[0].is_none());
+        assert!(legs_between(&track, &[Some(0), Some(99)])[0].is_none());
+        assert!(legs_between(&track, &[]).is_empty());
     }
 
     #[test]
@@ -165,10 +174,10 @@ mod tests {
                 wp(59.001, 18.002, 60),
             ],
         };
-        let legs = legs(&track, &[]);
-        assert_eq!(legs.len(), 1);
-        assert!(legs[0].detour_pct > 10.0, "detour {}", legs[0].detour_pct);
-        assert!(legs[0].route_length > legs[0].straight_distance);
+        let legs = legs_between(&track, &full(&track));
+        let leg = legs[0].as_ref().unwrap();
+        assert!(leg.detour_pct > 10.0, "detour {}", leg.detour_pct);
+        assert!(leg.route_length > leg.straight_distance);
     }
 
     #[test]
@@ -181,9 +190,10 @@ mod tests {
         let track = Track {
             points: vec![wp(59.0, 18.0, 0), no_time],
         };
-        let legs = legs(&track, &[]);
-        assert_eq!(legs[0].duration_secs, None);
-        assert_eq!(legs[0].pace_s_per_km, None);
+        let legs = legs_between(&track, &full(&track));
+        let leg = legs[0].as_ref().unwrap();
+        assert_eq!(leg.duration_secs, None);
+        assert_eq!(leg.pace_s_per_km, None);
     }
 
     #[test]
@@ -192,10 +202,11 @@ mod tests {
         let track = Track {
             points: vec![wp(59.0, 18.0, 0), wp(59.0, 18.0, 30)],
         };
-        let legs = legs(&track, &[]);
-        assert_eq!(legs[0].duration_secs, Some(30.0));
-        assert_eq!(legs[0].pace_s_per_km, None);
-        assert_eq!(legs[0].detour_pct, 0.0); // degenerate straight line guarded
+        let legs = legs_between(&track, &full(&track));
+        let leg = legs[0].as_ref().unwrap();
+        assert_eq!(leg.duration_secs, Some(30.0));
+        assert_eq!(leg.pace_s_per_km, None);
+        assert_eq!(leg.detour_pct, 0.0); // degenerate straight line guarded
     }
 
     #[test]
@@ -203,8 +214,8 @@ mod tests {
         let track = Track {
             points: vec![wp(59.0, 18.0, 0), wp(59.009, 18.0, 300)], // ~1 km in 5 min
         };
-        let legs = legs(&track, &[]);
-        let pace = legs[0].pace_s_per_km.unwrap();
+        let legs = legs_between(&track, &full(&track));
+        let pace = legs[0].as_ref().unwrap().pace_s_per_km.unwrap();
         assert!((pace - 300.0).abs() < 5.0, "pace {pace}");
     }
 

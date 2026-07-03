@@ -5,10 +5,13 @@ use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
 ///
 /// - `Matrix`: a 3x3 homogeneous transform (translation / similarity / affine).
 /// - `Tps`: an interpolating thin-plate spline that honors every control point exactly.
+/// - `Translated`: a base transform followed by a fixed pixel offset, used to honor
+///   a single calibration pin on top of a transform borrowed from another athlete.
 #[derive(Clone, Debug)]
 pub enum MapTransform {
     Matrix(Matrix3<f64>),
     Tps(Tps),
+    Translated(Box<MapTransform>, [f64; 2]),
 }
 
 /// A (source-meters, dest-pixel) correspondence used to fit a transform.
@@ -23,6 +26,10 @@ impl MapTransform {
                 (v.x / v.z, v.y / v.z)
             }
             MapTransform::Tps(t) => t.apply((x, y)),
+            MapTransform::Translated(base, d) => {
+                let (u, v) = base.apply((x, y));
+                (u + d[0], v + d[1])
+            }
         }
     }
 
@@ -138,6 +145,15 @@ mod tests {
     fn too_few_points_yield_no_fit() {
         assert!(MapTransform::fit(&[]).is_none());
         assert!(MapTransform::fit(&[((0.0, 0.0), (1.0, 1.0))]).is_none());
+    }
+
+    #[test]
+    fn translated_applies_base_then_offset() {
+        let base = MapTransform::Matrix(Matrix3::new(
+            2.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 0.0, 1.0,
+        ));
+        let t = MapTransform::Translated(Box::new(base), [10.0, -5.0]);
+        assert_eq!(t.apply((3.0, 4.0)), (2.0 * 3.0 + 1.0 + 10.0, 2.0 * 4.0 - 1.0 - 5.0));
     }
 
     #[test]

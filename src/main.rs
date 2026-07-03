@@ -2,6 +2,7 @@
 
 mod analysis;
 mod app;
+mod athlete;
 mod geo;
 mod io;
 mod model;

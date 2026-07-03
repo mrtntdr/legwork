@@ -1,36 +1,53 @@
 mod graphs;
+mod leg_analysis;
 mod map_view;
 mod panels;
 
-use crate::analysis::{color_for, control_indices};
+use crate::analysis::color_for;
 use crate::app::App;
 use crate::io;
 
 impl App {
-    /// Render the current map + colored route to a PNG at native resolution.
+    /// Render the current map with every visible athlete's route (and the shared
+    /// course controls) to a PNG at native resolution.
     pub(crate) fn export_png(&mut self) {
-        let (Some(map), Some(t)) = (&self.map, &self.transform) else {
+        let Some(map) = &self.map else {
             self.status = "Load a map and track before exporting.".into();
             return;
         };
         let mut segments = Vec::new();
-        for i in 0..self.projected.len().saturating_sub(1) {
-            let a = t.apply(self.projected[i]);
-            let b = t.apply(self.projected[i + 1]);
-            let pace = self.seg_metric.get(i).copied().unwrap_or(f64::NAN);
-            let rgba = color_for(pace, self.metric_range).to_array();
-            segments.push((a, b, rgba));
+        // Non-active athletes first so the active route draws on top, matching
+        // the on-screen layering.
+        let order = (0..self.athletes.len())
+            .filter(|&i| i != self.active)
+            .chain(std::iter::once(self.active));
+        for i in order {
+            let Some(a) = self.athletes.get(i) else { continue };
+            let (Some(t), true) = (&a.transform, a.visible) else {
+                continue;
+            };
+            let pace_colors = i == self.active && self.active_pace_colors;
+            for k in 0..a.projected.len().saturating_sub(1) {
+                let p0 = t.apply(a.projected[k]);
+                let p1 = t.apply(a.projected[k + 1]);
+                let rgba = if pace_colors {
+                    let pace = a.seg_metric.get(k).copied().unwrap_or(f64::NAN);
+                    color_for(pace, self.metric_range).to_array()
+                } else {
+                    a.color.to_array()
+                };
+                segments.push((p0, p1, rgba));
+            }
+        }
+        if segments.is_empty() {
+            self.status = "Load a map and track before exporting.".into();
+            return;
         }
         let markers: Vec<(f64, f64)> = self
-            .track
-            .as_ref()
-            .map(|track| {
-                control_indices(track, &self.controls)
-                    .iter()
-                    .filter_map(|&idx| self.projected.get(idx).map(|&m| t.apply(m)))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .controls
+            .iter()
+            .map(|c| (c.image_px[0], c.image_px[1]))
+            .collect();
 
         match io::render_png(&map.bytes, &segments, &markers) {
             Ok(png) => {
