@@ -12,6 +12,10 @@ The app is organized around two activities:
 - **Analysis** — the map is the read-only centerpiece: step through legs, replay the
   race, and open the splits/graphs drawers. A saved project opens straight here.
 
+## Executable files
+
+Pre-built files for Mac and Windows can be found under the relases: [https://github.com/mrtntdr/legwork/releases/tag/0.1.0](https://github.com/mrtntdr/legwork/releases/tag/0.1.0)
+
 ## Features
 
 ### Setup
