@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- IOF XML 3.0 course matching samples/example.gpx: import via File → Import
+     Course… once a georeferenced map is open or a track is calibrated. -->
+<CourseData xmlns="http://www.orienteering.org/datastandard/3.0" iofVersion="3.0">
+  <RaceCourseData>
+    <Control type="Start">
+      <Id>S1</Id>
+      <Position lng="18.06000" lat="59.33000"/>
+    </Control>
+    <Control>
+      <Id>31</Id>
+      <Position lng="18.06100" lat="59.33100"/>
+    </Control>
+    <Control>
+      <Id>32</Id>
+      <Position lng="18.06320" lat="59.33175"/>
+    </Control>
+    <Control>
+      <Id>33</Id>
+      <Position lng="18.06100" lat="59.33260"/>
+    </Control>
+    <Control type="Finish">
+      <Id>F1</Id>
+      <Position lng="18.06000" lat="59.33210"/>
+    </Control>
+    <Course>
+      <Name>Example</Name>
+      <CourseControl type="Start"><Control>S1</Control></CourseControl>
+      <CourseControl><Control>31</Control></CourseControl>
+      <CourseControl><Control>32</Control></CourseControl>
+      <CourseControl><Control>33</Control></CourseControl>
+      <CourseControl type="Finish"><Control>F1</Control></CourseControl>
+    </Course>
+  </RaceCourseData>
+</CourseData>

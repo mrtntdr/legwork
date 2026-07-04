@@ -52,6 +52,30 @@ pub struct AthleteFile {
     pub calibration: Vec<CalibrationPoint>,
 }
 
+/// Saved map georeferencing (from a world file or GeoTIFF): the pixel→world
+/// affine `[a, b, c, d, e, f]` plus the world CRS, kept in the project because
+/// sidecar files don't travel inside a `.legit` container.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GeorefFile {
+    pub px_to_world: [f64; 6],
+    pub crs: CrsFile,
+}
+
+/// Serialized CRS of a map's world coordinates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CrsFile {
+    Geographic,
+    TransverseMercator {
+        lon0: f64,
+        lat0: f64,
+        k0: f64,
+        false_e: f64,
+        false_n: f64,
+    },
+    Unknown,
+}
+
 /// The current project metadata stored as `project.json` inside a `.legit`
 /// container. The map image and each athlete's track file are separate zip entries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,6 +86,9 @@ pub struct ProjectFileV2 {
     pub controls: Vec<CoursePoint>,
     pub active: usize,
     pub view: ViewState,
+    /// Absent in projects saved before georeferencing support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub georef: Option<GeorefFile>,
 }
 
 /// The original single-track schema, kept so pre-multi-athlete projects still open.

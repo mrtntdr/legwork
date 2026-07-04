@@ -21,8 +21,20 @@ Pre-built files for Mac and Windows can be found under the relases: [https://git
 ### Setup
 
 - **Map image**: open JPEG / PNG / GIF / TIFF / BMP / WebP; pan & zoom canvas.
+- **Georeferenced maps**: a world-file sidecar (`.pgw`/`.jgw`/`.tfw`/`.wld`, with an
+  optional `.prj`) or embedded **GeoTIFF** tags are detected automatically when a map
+  is opened — every track then lands on the map with **no manual calibration**.
+  Supported world coordinates: geographic lat/lon and the transverse-Mercator family
+  (UTM, ETRS89/UTM, SWEREF 99 TM, TM35FIN, …); an unknown projected CRS is inferred
+  by testing UTM zones around the loaded tracks. The georeferencing is stored in the
+  project, so it survives without the sidecar. Manual pins still work on top, to
+  correct an individual watch's GPS drift.
 - **Track import**: unified GPX and TCX parser (captures time, elevation, and heart rate
   from GPX `gpxtpx` extensions and TCX `HeartRateBpm`).
+- **IOF XML course import**: **File → Import Course…** reads an IOF XML 3.0 course
+  file (OCAD, Purple Pen, Condes exports) and places its controls on the map in
+  course order — via the map's georeferencing, or a calibrated track. The first
+  course in the file is used; start/finish are implicit.
 - **Multiple athletes**: add any number of tracks against one shared map. Each athlete
   has a name, a route color, a visibility toggle, and their **own calibration**, so GPS
   offsets between different watches are corrected per person. One *active* athlete
@@ -91,8 +103,12 @@ On Linux you need the usual GUI dev packages: `libgtk-3-dev`, `libxcb-render0-de
    one point translates the route, two rotate/scale it, three or more warp it (TPS) so
    every locked point stays exactly on its feature. Other athletes inherit the
    alignment; pick each one in the Athletes list to fine-tune their own pins.
-5. In **Course** mode, click the map to place controls along the route. Every
-   athlete is matched to the course automatically.
+5. In **Course** mode, click the map to place controls along the route — or skip the
+   clicking with **File → Import Course…** and `samples/example-course.xml` (an IOF
+   XML course; needs a georeferenced map or one calibrated track). Every athlete is
+   matched to the course automatically.
+   *Tip: if your map has a world file (e.g. `map.pgw`) or is a GeoTIFF, step 4 is
+   unnecessary — tracks align by themselves.*
 6. Switch to the **Analysis** tab: step through legs with the strip above the map
    (or ←/→), open the **Splits** and **Graphs** drawers from the bottom bar, and
    tick **Replay** to animate the race (`Space` to play/pause).
@@ -110,8 +126,10 @@ src/
   athlete.rs         per-athlete runtime state (track, calibration, transform,
                      control matches, replay timeline)
   model/             Waypoint/Track, project (serde) types incl. V1→V2 migration
-  io/                GPX/TCX parser, image loader, .legit container, PNG export
-  geo/               local projection + similarity / TPS interpolating warp solving
+  io/                GPX/TCX parser, image loader, world-file/GeoTIFF georeferencing,
+                     IOF XML course import, .legit container, PNG export
+  geo/               local projection, transverse Mercator (UTM & friends),
+                     similarity / TPS interpolating warp solving
   analysis/          per-leg metrics, control↔track matching, cross-athlete
                      comparison, replay timing, pace/speed coloring
   ui/                map canvas (pan/zoom/drag, leg view, replay rendering),

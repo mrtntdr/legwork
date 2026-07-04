@@ -76,6 +76,7 @@ pub fn read_bundle(bytes: &[u8]) -> Result<ProjectBundle, String> {
                     controls: Vec::new(),
                     active: 0,
                     view: p.view,
+                    georef: None,
                 },
                 Some(controls),
             )
@@ -142,6 +143,16 @@ mod tests {
                     offset: [10.0, -20.0],
                     zoom: 1.5,
                 },
+                georef: Some(crate::model::GeorefFile {
+                    px_to_world: [2.0, 0.0, 650000.0, 0.0, -2.0, 6580000.0],
+                    crs: crate::model::CrsFile::TransverseMercator {
+                        lon0: 15.0,
+                        lat0: 0.0,
+                        k0: 0.9996,
+                        false_e: 500_000.0,
+                        false_n: 0.0,
+                    },
+                }),
             },
             image_bytes: vec![1, 2, 3, 4],
             tracks: vec![b"<gpx a/>".to_vec(), b"<gpx b/>".to_vec()],
@@ -164,6 +175,12 @@ mod tests {
         assert_eq!(back.image_bytes, vec![1, 2, 3, 4]);
         assert_eq!(back.tracks, vec![b"<gpx a/>".to_vec(), b"<gpx b/>".to_vec()]);
         assert!(back.legacy_control_indices.is_none());
+        let georef = back.project.georef.expect("georef survives the round trip");
+        assert_eq!(georef.px_to_world[2], 650000.0);
+        assert!(matches!(
+            georef.crs,
+            crate::model::CrsFile::TransverseMercator { lon0, .. } if lon0 == 15.0
+        ));
     }
 
     #[test]

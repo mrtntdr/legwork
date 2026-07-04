@@ -67,11 +67,25 @@ impl App {
                 && let Ok(bytes) = std::fs::read(&path)
             {
                 let name = file_name(&path);
+                // World-file sidecar or embedded GeoTIFF tags, when present, let
+                // tracks and IOF courses land on the map with no calibration.
+                let georef = crate::io::detect_georef(&path, &bytes);
                 let ctx = ui.ctx().clone();
-                self.load_image_from_bytes(&ctx, bytes, name);
+                self.load_image_from_bytes(&ctx, bytes, name, georef);
             }
             if ui.button("Add Track…").clicked() {
                 self.add_athlete_dialog();
+            }
+            if ui
+                .button("Import Course…")
+                .on_hover_text("IOF XML 3.0 course file (OCAD, Purple Pen, Condes)")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("IOF XML course", &["xml"])
+                    .pick_file()
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                self.import_course(&bytes);
             }
             ui.separator();
             if ui.button("Open Project…").clicked()

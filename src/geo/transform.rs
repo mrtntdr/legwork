@@ -45,6 +45,16 @@ impl MapTransform {
         }
     }
 
+    /// Least-squares affine fit (3+ points). Unlike `fit`, this never warps: it's
+    /// used for smooth mappings that are already near-affine, like composing a
+    /// georeferenced map's projection with the local meter frame.
+    pub fn fit_affine(pts: &[Correspondence]) -> Option<MapTransform> {
+        if pts.len() < 3 {
+            return None;
+        }
+        fit_affine(pts)
+    }
+
     /// Root-mean-square residual in pixels over the given correspondences.
     /// For exact fits this is ~0 at the control points.
     pub fn rms_residual(&self, pts: &[Correspondence]) -> f64 {

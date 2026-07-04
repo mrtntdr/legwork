@@ -5,7 +5,7 @@ use crate::analysis::{
 use crate::athlete::{ATHLETE_COLORS, Athlete};
 use crate::geo::{Correspondence, LocalProjection, MapTransform};
 use crate::io;
-use crate::io::ProjectBundle;
+use crate::io::{MapGeoref, ProjectBundle};
 use crate::model::{AthleteFile, CoursePoint, ProjectFileV2, ViewState};
 use chrono::{DateTime, Utc};
 use egui::{Color32, Pos2, TextureHandle, pos2};
@@ -103,6 +103,12 @@ pub struct App {
     /// every athlete's transform maps the same meter frame to image pixels (which
     /// lets an uncalibrated athlete borrow a calibrated athlete's transform).
     pub(crate) proj: Option<LocalProjection>,
+    /// Map georeferencing from a world file or GeoTIFF, when the map has one.
+    pub(crate) georef: Option<MapGeoref>,
+    /// The georef expressed as a shared meters→pixels transform (an affine fit of
+    /// the projection chain over the loaded tracks' extent). Used as the base for
+    /// every athlete without their own calibration.
+    georef_mt: Option<MapTransform>,
     /// The shared course: controls placed on the map, in course order.
     pub(crate) controls: Vec<CoursePoint>,
     pub(crate) metric_range: MetricRange,
@@ -164,6 +170,8 @@ impl App {
             athletes: Vec::new(),
             active: 0,
             proj: None,
+            georef: None,
+            georef_mt: None,
             controls: Vec::new(),
             metric_range: MetricRange { min: 0.0, max: 1.0 },
             color_auto: true,
@@ -224,6 +232,7 @@ impl App {
             // The next track re-anchors the shared projection.
             self.proj = None;
         }
+        self.refresh_georef_transform();
         self.recompute_metric_active();
     }
 
@@ -234,6 +243,7 @@ impl App {
         ctx: &egui::Context,
         bytes: Vec<u8>,
         name: String,
+        georef: Option<MapGeoref>,
     ) {
         match io::load_image(bytes) {
             Ok(loaded) => {
@@ -247,8 +257,13 @@ impl App {
                 });
                 self.image_name = name;
                 self.fit = Some(FitRequest::Map);
+                self.status = match &georef {
+                    Some(g) => format!("Loaded map ({w}x{h}) — georeferenced ({}).", g.describe()),
+                    None => format!("Loaded map ({w}x{h})."),
+                };
+                self.georef = georef;
+                self.refresh_georef_transform();
                 self.recompute_all_transforms();
-                self.status = format!("Loaded map ({w}x{h}).");
             }
             Err(e) => self.status = e,
         }
@@ -297,6 +312,10 @@ impl App {
                     timeline,
                 });
                 self.active = self.athletes.len() - 1;
+                // The shared projection may have just been anchored, and the georef
+                // fit samples the tracks' extent — refresh before the transform so
+                // a georeferenced map places this track immediately.
+                self.refresh_georef_transform();
                 self.recompute_transform_at(self.active);
                 self.recompute_metric_active();
             }
@@ -376,17 +395,72 @@ impl App {
         }
     }
 
-    /// Base transform for an athlete with no usable fit of their own: borrow the
-    /// transform of the best-calibrated other athlete (all transforms share one
-    /// meter frame), else fit this athlete's bounding box into the map.
+    /// Base transform for an athlete with no usable fit of their own, in order of
+    /// trust: the map's own georeferencing (survey-grade, unaffected by anyone's
+    /// GPS drift), then the best-calibrated other athlete's transform (all
+    /// transforms share one meter frame), then this athlete's bounding box fit
+    /// into the map.
     fn fallback_transform(&self, i: usize) -> Option<MapTransform> {
-        self.athletes
-            .iter()
-            .enumerate()
-            .filter(|&(j, a)| j != i && !a.calibration.is_empty() && a.transform.is_some())
-            .max_by_key(|&(_, a)| a.calibration.len())
-            .and_then(|(_, a)| a.transform.clone())
+        self.georef_mt
+            .clone()
+            .or_else(|| {
+                self.athletes
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, a)| j != i && !a.calibration.is_empty() && a.transform.is_some())
+                    .max_by_key(|&(_, a)| a.calibration.len())
+                    .and_then(|(_, a)| a.transform.clone())
+            })
             .or_else(|| self.initial_transform(&self.athletes.get(i)?.projected))
+    }
+
+    /// Rebuild `georef_mt`: resolve the georef's CRS if needed (using the first
+    /// track's centroid), then fit an affine meters→pixels transform by sampling
+    /// the lat/lon → grid → pixel chain over the loaded tracks' extent. The chain
+    /// is smooth and near-affine at map scale, so the fit residual is sub-pixel.
+    pub(crate) fn refresh_georef_transform(&mut self) {
+        self.georef_mt = None;
+        let Some(map) = &self.map else { return };
+        let (w, h) = (map.size[0] as f64, map.size[1] as f64);
+        let Some(proj) = self.proj else { return };
+
+        // Meter-space extent of all loaded tracks (the region the fit must serve).
+        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for a in &self.athletes {
+            for &(x, y) in &a.projected {
+                minx = minx.min(x);
+                maxx = maxx.max(x);
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+            }
+        }
+        if minx > maxx {
+            return;
+        }
+        let centroid = self.athletes.iter().find_map(|a| a.track.centroid());
+        let Some(georef) = self.georef.as_mut() else {
+            return;
+        };
+        let Some((clat, clon)) = centroid else { return };
+        if !georef.resolve_crs(clat, clon, w, h) {
+            return;
+        }
+
+        let dx = ((maxx - minx) * 0.1).max(50.0);
+        let dy = ((maxy - miny) * 0.1).max(50.0);
+        let (x0, x1, y0, y1) = (minx - dx, maxx + dx, miny - dy, maxy + dy);
+        let mut pts: Vec<Correspondence> = Vec::with_capacity(16);
+        for gy in 0..4 {
+            for gx in 0..4 {
+                let mx = x0 + (x1 - x0) * gx as f64 / 3.0;
+                let my = y0 + (y1 - y0) * gy as f64 / 3.0;
+                let (lat, lon) = proj.unproject(mx, my);
+                if let Some(px) = georef.latlon_to_px(lat, lon) {
+                    pts.push(((mx, my), px));
+                }
+            }
+        }
+        self.georef_mt = MapTransform::fit_affine(&pts);
     }
 
     /// Keep the fallback's scale/rotation but shift it so the single locked point
@@ -657,6 +731,70 @@ impl App {
         track.cumulative_distance().get(i).map(|&d| d / 1000.0)
     }
 
+    /// Map a WGS84 position to image pixels: through the map's georeferencing
+    /// when available, else through the best-calibrated athlete's transform.
+    pub(crate) fn latlon_to_px(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        if let Some(g) = &self.georef
+            && let Some(px) = g.latlon_to_px(lat, lon)
+        {
+            return Some(px);
+        }
+        let proj = self.proj?;
+        let m = proj.project(lat, lon);
+        let t = self
+            .athletes
+            .iter()
+            .filter(|a| !a.calibration.is_empty())
+            .max_by_key(|a| a.calibration.len())?
+            .transform
+            .as_ref()?;
+        Some(t.apply(m))
+    }
+
+    /// Import an IOF XML 3.0 course: place its controls on the map (replacing the
+    /// current course) using the file's geo positions.
+    pub(crate) fn import_course(&mut self, bytes: &[u8]) {
+        let course = match io::parse_iof_course(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("Course import failed: {e}");
+                return;
+            }
+        };
+        let pts: Vec<CoursePoint> = course
+            .controls
+            .iter()
+            .filter_map(|&(lat, lon)| self.latlon_to_px(lat, lon))
+            .map(|(x, y)| CoursePoint { image_px: [x, y] })
+            .collect();
+        if pts.is_empty() {
+            self.status = "Can't place the course yet: open a georeferenced map, or calibrate \
+                           a track first."
+                .into();
+            return;
+        }
+        let replaced = !self.controls.is_empty();
+        let n = pts.len();
+        self.controls = pts;
+        self.rematch_all();
+
+        let mut s = match &course.course_name {
+            Some(name) => format!("Imported course \"{name}\": {n} controls"),
+            None => format!("Imported {n} controls"),
+        };
+        if course.n_courses > 1 {
+            s += &format!(" (first of {} courses in the file)", course.n_courses);
+        }
+        if course.skipped > 0 {
+            s += &format!("; {} skipped without a geo position", course.skipped);
+        }
+        if replaced {
+            s += "; replaced the previous course";
+        }
+        s += ".";
+        self.status = s;
+    }
+
     /// Index of the active athlete's waypoint nearest to a screen point.
     pub(crate) fn nearest_waypoint(&self, origin: Pos2, p: Pos2) -> Option<usize> {
         let a = self.active()?;
@@ -694,6 +832,7 @@ impl App {
             controls: self.controls.clone(),
             active: self.active,
             view: self.view,
+            georef: self.georef.as_ref().map(|g| g.to_file()),
         }
     }
 
@@ -739,7 +878,8 @@ impl App {
         self.athletes.clear();
         self.proj = None;
         self.controls.clear();
-        self.load_image_from_bytes(ctx, bundle.image_bytes, project.image_name.clone());
+        let georef = project.georef.as_ref().map(MapGeoref::from_file);
+        self.load_image_from_bytes(ctx, bundle.image_bytes, project.image_name.clone(), georef);
         for (meta, track_bytes) in project.athletes.into_iter().zip(bundle.tracks) {
             let file_name = meta
                 .track_entry
