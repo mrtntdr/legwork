@@ -1,5 +1,6 @@
 use crate::analysis::{compare, fmt_duration, fmt_pace, leg_label, quickness_color};
-use crate::app::{App, EditMode, ViewTab};
+use crate::app::{App, EditMode, FitRequest, ViewTab};
+use crate::athlete::route_color;
 use egui::{Color32, RichText};
 
 /// Highlight color for the best (fastest) athlete in the leg summary.
@@ -205,9 +206,141 @@ impl App {
         if self.active_pace_colors {
             self.coloring_controls(ui);
         }
+        self.routes_section(ui);
         match self.selected_leg {
             Some(_) => self.leg_summary_section(ui),
             None => self.leaderboard_section(ui),
+        }
+    }
+
+    /// Analysis: the drawn route options (analysis board). With a leg selected it
+    /// lists that leg's variants — length, delta to the shortest, points — plus the
+    /// athletes' actual distances on the leg. In the whole-course view it lists
+    /// every route.
+    fn routes_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.heading("Route options");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.draw_mode, "✏ Draw")
+                    .on_hover_text("Draw route options on the map (D)")
+                    .clicked()
+                {
+                    self.toggle_draw_mode();
+                }
+            });
+        });
+        ui.label(
+            RichText::new(
+                "Click to drop points, drag to sketch. Double-click or Enter to finish, Esc to cancel.",
+            )
+            .weak()
+            .small(),
+        );
+
+        let leg = self.selected_leg;
+        let scored = self.controls.iter().any(|c| c.score.is_some());
+        let show: Vec<usize> = (0..self.drawn_routes.len())
+            .filter(|&i| match leg {
+                None => true,
+                Some(li) => self.drawn_routes[i].leg == Some(li),
+            })
+            .collect();
+
+        if show.is_empty() {
+            ui.label(RichText::new("No route options yet — turn on Draw.").weak().small());
+        } else {
+            let shortest = show
+                .iter()
+                .filter_map(|&i| self.drawn_stats.get(i).and_then(|s| s.length_m))
+                .fold(f64::INFINITY, f64::min);
+            let mut select: Option<usize> = None;
+            let mut delete: Option<usize> = None;
+            for (n, &i) in show.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let mut col = route_color(&self.drawn_routes[i], i);
+                    if ui.color_edit_button_srgba(&mut col).changed() {
+                        self.drawn_routes[i].color = Some([col.r(), col.g(), col.b()]);
+                    }
+                    let name = route_display_name(&self.drawn_routes[i], n, self.controls.len());
+                    if ui
+                        .selectable_label(self.selected_route == Some(i), name)
+                        .clicked()
+                    {
+                        select = Some(i);
+                    }
+                    let len = self.drawn_stats.get(i).and_then(|s| s.length_m);
+                    ui.label(
+                        len.map(|m| format!("{m:.0} m"))
+                            .unwrap_or_else(|| "— m".into()),
+                    );
+                    if let Some(m) = len
+                        && shortest.is_finite()
+                        && m > shortest + 0.5
+                    {
+                        ui.label(RichText::new(format!("+{:.0}", m - shortest)).weak().small());
+                    }
+                    if scored
+                        && let Some(s) = self.drawn_stats.get(i)
+                        && s.points > 0
+                    {
+                        ui.label(RichText::new(format!("· {} p", s.points)).weak().small());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").on_hover_text("Delete route").clicked() {
+                            delete = Some(i);
+                        }
+                    });
+                });
+            }
+            if let Some(i) = select {
+                self.selected_route = Some(i);
+                if let Some((min, max)) = self.route_bbox(i) {
+                    self.fit = Some(FitRequest::Rect { min, max });
+                }
+            }
+            if let Some(i) = delete {
+                self.drawn_routes.remove(i);
+                if self.selected_route == Some(i) {
+                    self.selected_route = None;
+                }
+                self.recompute_drawn_stats();
+            }
+        }
+
+        // The athletes' actual distances on the selected leg, for comparison.
+        if let Some(li) = leg {
+            let rows: Vec<(Color32, String, Option<f64>)> = self
+                .athletes
+                .iter()
+                .filter(|a| a.visible)
+                .map(|a| {
+                    let b = a.boundaries();
+                    let m = match (
+                        b.get(li).copied().flatten(),
+                        b.get(li + 1).copied().flatten(),
+                    ) {
+                        (Some(f), Some(t)) if f <= t => Some(a.track.route_length(f, t)),
+                        _ => None,
+                    };
+                    (a.color, a.name.clone(), m)
+                })
+                .collect();
+            if !rows.is_empty() {
+                ui.add_space(2.0);
+                ui.label(RichText::new("Ran on this leg:").weak().small());
+                for (color, name, m) in rows {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("●").color(color));
+                        ui.label(&name);
+                        match m {
+                            Some(m) => ui.label(RichText::new(format!("{m:.0} m")).weak()),
+                            None => ui.label(RichText::new("–").weak()),
+                        };
+                    });
+                }
+            }
         }
     }
 
@@ -277,6 +410,41 @@ impl App {
             .weak()
             .small(),
         );
+
+        if !self.controls.is_empty() {
+            let mut changed = false;
+            egui::CollapsingHeader::new("Scores (rogaine)")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Point value per control; 0 = no score.")
+                            .weak()
+                            .small(),
+                    );
+                    for (i, c) in self.controls.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{}", i + 1));
+                            let mut v = c.score.unwrap_or(0) as i32;
+                            if ui
+                                .add(egui::DragValue::new(&mut v).range(0..=1000).speed(1.0))
+                                .changed()
+                            {
+                                c.score = (v > 0).then_some(v as u32);
+                                changed = true;
+                            }
+                        });
+                    }
+                    if ui.button("Clear scores").clicked() {
+                        for c in self.controls.iter_mut() {
+                            c.score = None;
+                        }
+                        changed = true;
+                    }
+                });
+            if changed {
+                self.recompute_drawn_stats();
+            }
+        }
     }
 
     /// When a leg is selected on the map, a compact per-athlete summary for that
@@ -647,6 +815,20 @@ fn file_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into())
+}
+
+/// The label shown for a drawn route: its user name, else an auto-name — a variant
+/// letter per leg ("2–3 A"), or "Route n" for a free-form route. `n` is the
+/// route's position within the list currently shown.
+fn route_display_name(r: &crate::model::DrawnRoute, n: usize, n_controls: usize) -> String {
+    if !r.name.is_empty() {
+        return r.name.clone();
+    }
+    let letter = (b'A' + (n % 26) as u8) as char;
+    match r.leg {
+        Some(li) => format!("{} {letter}", leg_label(li, n_controls)),
+        None => format!("Route {}", n + 1),
+    }
 }
 
 #[cfg(test)]

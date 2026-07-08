@@ -1,5 +1,5 @@
 use crate::geo::MapTransform;
-use crate::model::{CalibrationPoint, Track};
+use crate::model::{CalibrationPoint, DrawnRoute, Track};
 use chrono::{DateTime, Utc};
 use egui::Color32;
 
@@ -14,6 +14,14 @@ pub const ATHLETE_COLORS: [Color32; 8] = [
     Color32::from_rgb(235, 80, 200),  // magenta
     Color32::from_rgb(170, 210, 60),  // yellow-green
 ];
+
+/// A drawn route's color: its override if set, else a palette color by index.
+pub fn route_color(r: &DrawnRoute, i: usize) -> Color32 {
+    match r.color {
+        Some([a, b, c]) => Color32::from_rgb(a, b, c),
+        None => ATHLETE_COLORS[i % ATHLETE_COLORS.len()],
+    }
+}
 
 /// One loaded runner: their track, per-athlete georeferencing, and display state.
 /// The map image and the course (controls) are shared across athletes; each

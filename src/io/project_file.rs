@@ -77,6 +77,7 @@ pub fn read_bundle(bytes: &[u8]) -> Result<ProjectBundle, String> {
                     active: 0,
                     view: p.view,
                     georef: None,
+                    routes: Vec::new(),
                 },
                 Some(controls),
             )
@@ -137,6 +138,7 @@ mod tests {
                 ],
                 controls: vec![CoursePoint {
                     image_px: [42.0, 43.5],
+                    score: Some(20),
                 }],
                 active: 1,
                 view: ViewState {
@@ -154,6 +156,12 @@ mod tests {
                         false_n: 0.0,
                     },
                 }),
+                routes: vec![crate::model::DrawnRoute {
+                    points: vec![[1.0, 1.0], [2.0, 2.0], [3.0, 1.0]],
+                    leg: Some(1),
+                    name: String::new(),
+                    color: None,
+                }],
             },
             image_bytes: vec![1, 2, 3, 4],
             tracks: vec![b"<gpx a/>".to_vec(), b"<gpx b/>".to_vec()],
@@ -171,6 +179,10 @@ mod tests {
         assert_eq!(back.project.athletes[0].calibration[0].track_index, 7);
         assert_eq!(back.project.athletes[1].visible, false);
         assert_eq!(back.project.controls[0].image_px, [42.0, 43.5]);
+        assert_eq!(back.project.controls[0].score, Some(20));
+        assert_eq!(back.project.routes.len(), 1);
+        assert_eq!(back.project.routes[0].leg, Some(1));
+        assert_eq!(back.project.routes[0].points.len(), 3);
         assert_eq!(back.project.active, 1);
         assert_eq!(back.project.view.zoom, 1.5);
         assert_eq!(back.image_bytes, vec![1, 2, 3, 4]);
@@ -212,6 +224,7 @@ mod tests {
         assert_eq!(back.project.athletes[0].track_entry, "run.gpx");
         assert_eq!(back.project.athletes[0].calibration.len(), 1);
         assert!(back.project.controls.is_empty());
+        assert!(back.project.routes.is_empty());
         assert_eq!(back.legacy_control_indices, Some(vec![12, 30]));
         assert_eq!(back.tracks, vec![b"<gpx/>".to_vec()]);
         assert_eq!(back.project.view.zoom, 2.0);

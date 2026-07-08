@@ -1,12 +1,12 @@
 use crate::analysis::{
-    ClockMode, MetricRange, Window, auto_range, build_timeline, local_scale_px_per_m,
-    match_controls, playback, segment_metric, total_span,
+    ClockMode, MetricRange, RouteStats, Window, auto_range, build_timeline, collected_controls,
+    local_scale_px_per_m, match_controls, playback, route_midpoint_px, segment_metric, total_span,
 };
 use crate::athlete::{ATHLETE_COLORS, Athlete};
-use crate::geo::{Correspondence, LocalProjection, MapTransform};
+use crate::geo::{Correspondence, LocalProjection, MapTransform, invert_transform};
 use crate::io;
-use crate::io::{MapGeoref, ProjectBundle};
-use crate::model::{AthleteFile, CoursePoint, ProjectFileV2, ViewState};
+use crate::io::{Crs, MapGeoref, ProjectBundle};
+use crate::model::{AthleteFile, CoursePoint, DrawnRoute, ProjectFileV2, ViewState, Waypoint, haversine};
 use chrono::{DateTime, Utc};
 use egui::{Color32, Pos2, TextureHandle, pos2};
 use std::path::PathBuf;
@@ -40,6 +40,21 @@ pub enum DragTarget {
     View,
     Calibration(usize),
     Control(usize),
+    /// Moving one vertex of a finished drawn route.
+    RouteVertex { route: usize, vertex: usize },
+    /// A freehand pen stroke feeding the current route draft.
+    RouteSketch,
+}
+
+/// An in-progress drawn route. `points` are the committed image-pixel vertices;
+/// `stroke` holds the raw samples of the current freehand drag before it's
+/// simplified and appended; `checkpoints` records the vertex count before each
+/// click/stroke so one undo removes exactly one action.
+#[derive(Default)]
+pub struct RouteDraft {
+    pub points: Vec<[f64; 2]>,
+    pub stroke: Vec<[f64; 2]>,
+    pub checkpoints: Vec<usize>,
 }
 
 /// A pending view fit, applied on the next frame once the canvas rect is known.
@@ -92,6 +107,15 @@ impl Default for Playback {
 /// Matching radius around a control, in meters on the ground.
 const MATCH_RADIUS_M: f64 = 60.0;
 
+/// A bare lat/lon waypoint, for measuring great-circle distances.
+fn ll(lat: f64, lon: f64) -> Waypoint {
+    Waypoint {
+        lat,
+        lon,
+        ..Waypoint::default()
+    }
+}
+
 pub struct App {
     // Loaded data
     pub(crate) map: Option<MapImage>,
@@ -111,6 +135,14 @@ pub struct App {
     georef_mt: Option<MapTransform>,
     /// The shared course: controls placed on the map, in course order.
     pub(crate) controls: Vec<CoursePoint>,
+    /// User-drawn route options (the analysis board). Persisted.
+    pub(crate) drawn_routes: Vec<DrawnRoute>,
+    /// Derived per-route stats (length, collected controls, points), parallel to
+    /// `drawn_routes`. Rebuilt by `recompute_drawn_stats`; never persisted.
+    pub(crate) drawn_stats: Vec<RouteStats>,
+    /// Cached pixels→meters transform (inverse of a calibrated athlete's map
+    /// transform), used to measure drawn routes when the map isn't georeferenced.
+    px_to_m: Option<MapTransform>,
     pub(crate) metric_range: MetricRange,
     /// When true, the coloring range is auto-fit to the data; when false the user
     /// has set the fast/slow cutoffs manually.
@@ -148,6 +180,12 @@ pub struct App {
     /// Selected leg for the on-map leg view (0-based leg index), or `None` for
     /// the whole-course view. Leg `li` runs from boundary `li` to `li + 1`.
     pub(crate) selected_leg: Option<usize>,
+    /// Analysis-tab draw mode: click/drag on the map sketches route options.
+    pub(crate) draw_mode: bool,
+    /// The route being drawn right now, if any.
+    pub(crate) draft: Option<RouteDraft>,
+    /// The currently highlighted drawn route (index into `drawn_routes`).
+    pub(crate) selected_route: Option<usize>,
     /// Replay animation state.
     pub(crate) playback: Playback,
 
@@ -176,6 +214,9 @@ impl App {
             georef: None,
             georef_mt: None,
             controls: Vec::new(),
+            drawn_routes: Vec::new(),
+            drawn_stats: Vec::new(),
+            px_to_m: None,
             metric_range: MetricRange { min: 0.0, max: 1.0 },
             color_auto: true,
             palette_view: None,
@@ -194,6 +235,9 @@ impl App {
             fit: None,
             pending_rotate: None,
             selected_leg: None,
+            draw_mode: false,
+            draft: None,
+            selected_route: None,
             playback: Playback::default(),
             hover_km: None,
             hover_index: None,
@@ -370,6 +414,7 @@ impl App {
             a.transform = t;
         }
         self.rematch_athlete(i);
+        self.refresh_px_to_m();
     }
 
     /// Recompute every athlete's transform, best-calibrated first so uncalibrated
@@ -467,6 +512,7 @@ impl App {
             }
         }
         self.georef_mt = MapTransform::fit_affine(&pts);
+        self.refresh_px_to_m();
     }
 
     /// Keep the fallback's scale/rotation but shift it so the single locked point
@@ -552,6 +598,10 @@ impl App {
             self.rematch_athlete(i);
         }
         self.clamp_selected_leg();
+        // A course edit can orphan a leg-attached route and moves control
+        // positions, so re-derive route attachments and stats.
+        self.reconcile_drawn_routes();
+        self.recompute_drawn_stats();
     }
 
     // --- Leg view --------------------------------------------------------------
@@ -777,6 +827,170 @@ impl App {
         Some(t.apply(m))
     }
 
+    // --- Drawn route options (analysis board) --------------------------------
+
+    /// Meter-space bounding box of all loaded tracks — the region the pixel→meters
+    /// inverse must serve. `None` when nothing is projected yet.
+    fn tracks_bounds_m(&self) -> Option<((f64, f64), (f64, f64))> {
+        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for a in &self.athletes {
+            for &(x, y) in &a.projected {
+                minx = minx.min(x);
+                maxx = maxx.max(x);
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+            }
+        }
+        // Pad so a degenerate (single-track-point) extent still has area.
+        (minx <= maxx).then(|| {
+            let dx = ((maxx - minx) * 0.1).max(50.0);
+            let dy = ((maxy - miny) * 0.1).max(50.0);
+            ((minx - dx, miny - dy), (maxx + dx, maxy + dy))
+        })
+    }
+
+    /// Rebuild the cached pixels→meters transform from the best-calibrated
+    /// athlete's map transform (needs ≥2 pins for a real ground scale), then
+    /// refresh the drawn-route stats that depend on it. The georef path is applied
+    /// per-point in `px_polyline_len_m`, so it isn't cached here.
+    pub(crate) fn refresh_px_to_m(&mut self) {
+        self.px_to_m = self.tracks_bounds_m().and_then(|bounds| {
+            let t = self
+                .athletes
+                .iter()
+                .filter(|a| a.calibration.len() >= 2 && a.transform.is_some())
+                .max_by_key(|a| a.calibration.len())?
+                .transform
+                .as_ref()?;
+            invert_transform(t, bounds)
+        });
+        self.recompute_drawn_stats();
+    }
+
+    /// Ground length of a pixel-space polyline in meters, or `None` if the map
+    /// can't be measured yet. Prefers the map's georeferencing, then the inverse
+    /// of a calibrated athlete's transform.
+    pub(crate) fn px_polyline_len_m(&self, pts: &[[f64; 2]]) -> Option<f64> {
+        if pts.len() < 2 {
+            return Some(0.0);
+        }
+        if let Some(g) = &self.georef {
+            match g.crs {
+                Crs::TransverseMercator(_) => {
+                    // Grid meters: straight Euclidean sum in world coordinates.
+                    return Some(
+                        pts.windows(2)
+                            .map(|w| {
+                                let a = g.px_to_world(w[0][0], w[0][1]);
+                                let b = g.px_to_world(w[1][0], w[1][1]);
+                                ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()
+                            })
+                            .sum(),
+                    );
+                }
+                Crs::Geographic => {
+                    // World coords are lon/lat: sum great-circle segments.
+                    return Some(
+                        pts.windows(2)
+                            .map(|w| {
+                                let a = g.px_to_world(w[0][0], w[0][1]);
+                                let b = g.px_to_world(w[1][0], w[1][1]);
+                                haversine(&ll(a.1, a.0), &ll(b.1, b.0))
+                            })
+                            .sum(),
+                    );
+                }
+                Crs::UnknownProjected => {} // fall through to the calibration path
+            }
+        }
+        let t = self.px_to_m.as_ref()?;
+        Some(
+            pts.windows(2)
+                .map(|w| {
+                    let a = t.apply((w[0][0], w[0][1]));
+                    let b = t.apply((w[1][0], w[1][1]));
+                    ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()
+                })
+                .sum(),
+        )
+    }
+
+    /// Pixels per ground meter near an image point, for scaling the control
+    /// collection radius. `None` when the map can't be measured.
+    fn px_per_m_at(&self, px: (f64, f64)) -> Option<f64> {
+        if let Some(g) = &self.georef
+            && matches!(g.crs, Crs::TransverseMercator(_))
+        {
+            let o = g.px_to_world(px.0, px.1);
+            let ex = g.px_to_world(px.0 + 1.0, px.1);
+            let ey = g.px_to_world(px.0, px.1 + 1.0);
+            let mx = ((ex.0 - o.0).powi(2) + (ex.1 - o.1).powi(2)).sqrt();
+            let my = ((ey.0 - o.0).powi(2) + (ey.1 - o.1).powi(2)).sqrt();
+            let m_per_px = (mx + my) / 2.0;
+            if m_per_px > 1e-9 {
+                return Some(1.0 / m_per_px);
+            }
+        }
+        // `px_to_m` maps pixels→meters, so its local scale is meters per pixel.
+        let t = self.px_to_m.as_ref()?;
+        let m_per_px = local_scale_px_per_m(t, px);
+        (m_per_px > 1e-9).then_some(1.0 / m_per_px)
+    }
+
+    /// Rebuild every drawn route's derived stats (length, collected controls,
+    /// points). Cheap for the handful of routes a user draws.
+    pub(crate) fn recompute_drawn_stats(&mut self) {
+        let controls: Vec<[f64; 2]> = self.controls.iter().map(|c| c.image_px).collect();
+        self.drawn_stats = self
+            .drawn_routes
+            .iter()
+            .map(|r| {
+                let length_m = self.px_polyline_len_m(&r.points);
+                let radius = route_midpoint_px(&r.points)
+                    .and_then(|m| self.px_per_m_at((m[0], m[1])))
+                    .map(|ppm| (MATCH_RADIUS_M * ppm).clamp(20.0, 300.0))
+                    .unwrap_or(40.0);
+                let collected = collected_controls(&r.points, &controls, radius);
+                let points = collected
+                    .iter()
+                    .filter_map(|&i| self.controls.get(i).and_then(|c| c.score))
+                    .sum();
+                RouteStats {
+                    length_m,
+                    collected,
+                    points,
+                }
+            })
+            .collect();
+    }
+
+    /// Detach any drawn route whose leg no longer exists (controls were removed),
+    /// degrading it to a free-form route rather than dropping it.
+    pub(crate) fn reconcile_drawn_routes(&mut self) {
+        let n = self.n_legs();
+        for r in &mut self.drawn_routes {
+            if r.leg.is_some_and(|li| li >= n) {
+                r.leg = None;
+            }
+        }
+    }
+
+    /// Image-space bounding box of a drawn route, to frame it on select.
+    pub(crate) fn route_bbox(&self, i: usize) -> Option<((f64, f64), (f64, f64))> {
+        let r = self.drawn_routes.get(i)?;
+        if r.points.is_empty() {
+            return None;
+        }
+        let (mut min, mut max) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+        for p in &r.points {
+            min.0 = min.0.min(p[0]);
+            min.1 = min.1.min(p[1]);
+            max.0 = max.0.max(p[0]);
+            max.1 = max.1.max(p[1]);
+        }
+        Some((min, max))
+    }
+
     /// Import an IOF XML 3.0 course: place its controls on the map (replacing the
     /// current course) using the file's geo positions.
     pub(crate) fn import_course(&mut self, bytes: &[u8]) {
@@ -791,7 +1005,7 @@ impl App {
             .controls
             .iter()
             .filter_map(|&(lat, lon)| self.latlon_to_px(lat, lon))
-            .map(|(x, y)| CoursePoint { image_px: [x, y] })
+            .map(|(x, y)| CoursePoint::at(x, y))
             .collect();
         if pts.is_empty() {
             self.status = "Can't place the course yet: open a georeferenced map, or calibrate \
@@ -859,6 +1073,7 @@ impl App {
             active: self.active,
             view: self.view,
             georef: self.georef.as_ref().map(|g| g.to_file()),
+            routes: self.drawn_routes.clone(),
         }
     }
 
@@ -928,6 +1143,10 @@ impl App {
             .active
             .min(self.athletes.len().saturating_sub(1));
         self.controls = project.controls;
+        self.drawn_routes = project.routes;
+        self.selected_route = None;
+        self.draft = None;
+        self.draw_mode = false;
         self.recompute_all_transforms();
 
         // V1 controls were waypoint indices into the single track; place them on the
@@ -941,7 +1160,7 @@ impl App {
                 .filter_map(|&i| a.projected.get(i))
                 .map(|&m| {
                     let (x, y) = t.apply(m);
-                    CoursePoint { image_px: [x, y] }
+                    CoursePoint::at(x, y)
                 })
                 .collect();
         }

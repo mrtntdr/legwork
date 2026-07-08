@@ -1,8 +1,9 @@
-use crate::analysis::color_for;
-use crate::app::{App, DragTarget, EditMode, FitRequest, ViewTab};
-use crate::athlete::Athlete;
-use crate::model::{CalibrationPoint, CoursePoint};
-use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2};
+use crate::analysis::{color_for, route_midpoint_px};
+use crate::app::{App, DragTarget, EditMode, FitRequest, RouteDraft, ViewTab};
+use crate::athlete::{Athlete, route_color};
+use crate::geo::{point_segment_dist, simplify_polyline};
+use crate::model::{CalibrationPoint, CoursePoint, DrawnRoute};
+use egui::{Align2, Color32, FontId, Rect, Sense, Shape, Stroke, pos2, vec2};
 
 const HIT_RADIUS: f32 = 12.0;
 const SNAP_RADIUS: f32 = 40.0;
@@ -23,6 +24,14 @@ impl App {
 
             if analysis {
                 self.analysis_shortcuts(ui);
+                // In draw mode, Ctrl/Cmd+Z steps back one drawing action.
+                if self.draw_mode {
+                    let undo =
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
+                    if undo {
+                        self.undo_draw();
+                    }
+                }
             } else {
                 // Ctrl/Cmd+Z removes the active athlete's latest calibration point.
                 let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
@@ -41,6 +50,9 @@ impl App {
             painter.rect_filled(rect, 0.0, Color32::from_gray(30));
             self.draw_map(&painter, origin);
             self.draw_routes(&painter, origin);
+            if analysis {
+                self.draw_drawn_routes(&painter, origin);
+            }
             self.draw_markers(&painter, origin);
         });
     }
@@ -51,16 +63,32 @@ impl App {
         if ui.ctx().memory(|m| m.focused().is_some()) {
             return;
         }
-        let (left, right, esc, space) = ui.input(|i| {
+        let (left, right, esc, space, draw_key, enter) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::D),
+                i.key_pressed(egui::Key::Enter),
             )
         });
-        if esc && self.selected_leg.is_some() {
-            self.select_leg(None);
+        if draw_key {
+            self.toggle_draw_mode();
+        }
+        if enter && self.draw_mode && let Some(draft) = self.draft.take() {
+            self.finish_route(draft);
+        }
+        // Esc unwinds one step at a time: cancel the draft, then leave draw mode,
+        // then drop the leg selection.
+        if esc {
+            if self.draft.is_some() {
+                self.draft = None;
+            } else if self.draw_mode {
+                self.draw_mode = false;
+            } else if self.selected_leg.is_some() {
+                self.select_leg(None);
+            }
         }
         if !self.controls.is_empty() {
             let n = self.n_legs();
@@ -204,6 +232,13 @@ impl App {
                     Some(li) => Some(li + 1),
                 });
             }
+            if ui
+                .selectable_label(self.draw_mode, "✏ Draw")
+                .on_hover_text("Draw route options on the map (D)")
+                .clicked()
+            {
+                self.toggle_draw_mode();
+            }
         });
         if let Some(sel) = pick {
             self.select_leg(sel);
@@ -313,7 +348,9 @@ impl App {
                 EditMode::Calibrate => self.handle_calibrate(resp, origin),
                 EditMode::Control => self.handle_control_mode(resp, origin),
             },
-            // Analysis: read-only — pan/zoom, and clicking a control jumps to a leg.
+            // Analysis: read-only for the course. Draw mode sketches route options;
+            // otherwise pan/zoom and clicking a control jumps to a leg.
+            ViewTab::Analysis if self.draw_mode => self.handle_draw_mode(resp, origin),
             ViewTab::Analysis => {
                 if resp.dragged() {
                     self.pan(resp);
@@ -383,9 +420,7 @@ impl App {
             self.status = "Removed control.".into();
         } else {
             let img = self.to_image(origin, p);
-            self.controls.push(CoursePoint {
-                image_px: [img.0, img.1],
-            });
+            self.controls.push(CoursePoint::at(img.0, img.1));
             self.rematch_all();
             self.status = format!("Placed control {}.", self.controls.len());
         }
@@ -493,6 +528,357 @@ impl App {
         }
         // 3. Empty space: pan.
         DragTarget::View
+    }
+
+    // --- Draw mode (route options) -------------------------------------------
+
+    /// Toggle the analysis-tab draw mode; leaving it cancels any in-progress draft.
+    pub(crate) fn toggle_draw_mode(&mut self) {
+        self.draw_mode = !self.draw_mode;
+        if self.draw_mode {
+            self.tab = ViewTab::Analysis;
+            self.status =
+                "Draw mode: click to drop points or drag to sketch; double-click or Enter to \
+                 finish, Esc to cancel."
+                    .into();
+        } else {
+            self.draft = None;
+            self.status = "Draw mode off.".into();
+        }
+    }
+
+    /// Whether a drawn route is shown/edited under the current leg selection:
+    /// the whole-course view shows all routes; a leg view shows only its variants.
+    fn route_visible(&self, r: &DrawnRoute, leg: Option<usize>) -> bool {
+        match leg {
+            None => true,
+            Some(li) => r.leg == Some(li),
+        }
+    }
+
+    /// The finished-route vertex under a screen point, if any (route, vertex).
+    fn route_vertex_at(&self, origin: egui::Pos2, p: egui::Pos2) -> Option<(usize, usize)> {
+        let leg = self.effective_leg();
+        for (ri, r) in self.drawn_routes.iter().enumerate() {
+            if !self.route_visible(r, leg) {
+                continue;
+            }
+            for (vi, v) in r.points.iter().enumerate() {
+                if (self.to_screen(origin, (v[0], v[1])) - p).length() < HIT_RADIUS {
+                    return Some((ri, vi));
+                }
+            }
+        }
+        None
+    }
+
+    /// The finished route whose polyline passes nearest a screen point (within the
+    /// hit radius), for click-to-select.
+    fn route_segment_at(&self, origin: egui::Pos2, p: egui::Pos2) -> Option<usize> {
+        let leg = self.effective_leg();
+        let mut best: Option<(usize, f64)> = None;
+        for (ri, r) in self.drawn_routes.iter().enumerate() {
+            if !self.route_visible(r, leg) {
+                continue;
+            }
+            for w in r.points.windows(2) {
+                let a = self.to_screen(origin, (w[0][0], w[0][1]));
+                let b = self.to_screen(origin, (w[1][0], w[1][1]));
+                let d = point_segment_dist([p.x as f64, p.y as f64], [a.x as f64, a.y as f64], [
+                    b.x as f64, b.y as f64,
+                ]);
+                if d < HIT_RADIUS as f64 && best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((ri, d));
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Click drops a vertex (or selects a finished route); drag on empty space
+    /// sketches freehand; drag on a finished vertex moves it. Double-click/Enter
+    /// finish. Panning is wheel/touchpad only here, since drag is the pen.
+    fn handle_draw_mode(&mut self, resp: &egui::Response, origin: egui::Pos2) {
+        if resp.drag_started()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            if self.draft.is_none()
+                && let Some((ri, vi)) = self.route_vertex_at(origin, p)
+            {
+                self.selected_route = Some(ri);
+                self.drag = Some(DragTarget::RouteVertex {
+                    route: ri,
+                    vertex: vi,
+                });
+            } else {
+                let start = self.to_image(origin, p);
+                let d = self.draft.get_or_insert_with(RouteDraft::default);
+                d.stroke.clear();
+                d.stroke.push([start.0, start.1]);
+                self.drag = Some(DragTarget::RouteSketch);
+            }
+        }
+        if resp.dragged() {
+            match self.drag {
+                Some(DragTarget::RouteVertex { route, vertex }) => {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        let img = self.to_image(origin, p);
+                        if let Some(v) = self
+                            .drawn_routes
+                            .get_mut(route)
+                            .and_then(|r| r.points.get_mut(vertex))
+                        {
+                            *v = [img.0, img.1];
+                        }
+                    }
+                }
+                Some(DragTarget::RouteSketch) => {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        let img = self.to_image(origin, p);
+                        let thr = (2.0 / self.view.zoom as f64).max(0.1);
+                        if let Some(d) = &mut self.draft {
+                            let far = d.stroke.last().is_none_or(|l| {
+                                (l[0] - img.0).powi(2) + (l[1] - img.1).powi(2) > thr * thr
+                            });
+                            if far {
+                                d.stroke.push([img.0, img.1]);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if resp.drag_stopped() {
+            match self.drag {
+                Some(DragTarget::RouteVertex { .. }) => self.recompute_drawn_stats(),
+                Some(DragTarget::RouteSketch) => self.commit_stroke(),
+                _ => {}
+            }
+            self.drag = None;
+        }
+        // A double-click finishes; its second click also fired `clicked` and
+        // appended a duplicate final vertex, so drop that one.
+        if resp.double_clicked() {
+            if let Some(mut d) = self.draft.take() {
+                d.points.pop();
+                self.finish_route(d);
+            }
+            return;
+        }
+        if resp.clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            if self.draft.is_none() {
+                if let Some((ri, _)) = self.route_vertex_at(origin, p) {
+                    self.selected_route = Some(ri);
+                } else if let Some(ri) = self.route_segment_at(origin, p) {
+                    self.selected_route = Some(ri);
+                } else {
+                    let img = self.to_image(origin, p);
+                    self.draft = Some(RouteDraft {
+                        points: vec![[img.0, img.1]],
+                        stroke: Vec::new(),
+                        checkpoints: vec![0],
+                    });
+                    self.selected_route = None;
+                }
+            } else {
+                let img = self.to_image(origin, p);
+                if let Some(d) = &mut self.draft {
+                    d.checkpoints.push(d.points.len());
+                    d.points.push([img.0, img.1]);
+                }
+            }
+        }
+        if resp.secondary_clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            self.delete_route_vertex_at(origin, p);
+        }
+    }
+
+    /// Simplify the just-finished freehand stroke and append it to the draft.
+    fn commit_stroke(&mut self) {
+        let tol = (2.5 / self.view.zoom as f64).max(0.25);
+        if let Some(d) = &mut self.draft {
+            if d.stroke.len() >= 2 {
+                let simplified = simplify_polyline(&d.stroke, tol);
+                d.checkpoints.push(d.points.len());
+                // Skip the first sample when joining onto existing vertices.
+                let skip = usize::from(!d.points.is_empty());
+                d.points.extend(simplified.into_iter().skip(skip));
+            }
+            d.stroke.clear();
+        }
+    }
+
+    /// Commit a finished draft as a drawn route, snapping its ends to the selected
+    /// leg's controls when close enough.
+    fn finish_route(&mut self, mut draft: RouteDraft) {
+        if draft.points.len() < 2 {
+            self.status = "A route needs at least two points.".into();
+            return;
+        }
+        let leg = self.selected_leg;
+        if let Some(li) = leg {
+            let snap = (SNAP_RADIUS as f64 / self.view.zoom as f64).max(1.0);
+            let snap2 = snap * snap;
+            let last = draft.points.len() - 1;
+            if li >= 1
+                && let Some(c) = self.controls.get(li - 1)
+                && dist2(draft.points[0], c.image_px) <= snap2
+            {
+                draft.points[0] = c.image_px;
+            }
+            if li < self.controls.len()
+                && let Some(c) = self.controls.get(li)
+                && dist2(draft.points[last], c.image_px) <= snap2
+            {
+                draft.points[last] = c.image_px;
+            }
+        }
+        self.drawn_routes.push(DrawnRoute {
+            points: draft.points,
+            leg,
+            name: String::new(),
+            color: None,
+        });
+        self.selected_route = Some(self.drawn_routes.len() - 1);
+        self.recompute_drawn_stats();
+        self.status = "Added a route option.".into();
+    }
+
+    /// Right-click deletes the vertex under the cursor; a route with fewer than two
+    /// vertices left is removed entirely.
+    fn delete_route_vertex_at(&mut self, origin: egui::Pos2, p: egui::Pos2) {
+        if let Some((ri, vi)) = self.route_vertex_at(origin, p) {
+            let emptied = self
+                .drawn_routes
+                .get_mut(ri)
+                .map(|r| {
+                    r.points.remove(vi);
+                    r.points.len() < 2
+                })
+                .unwrap_or(false);
+            if emptied {
+                self.drawn_routes.remove(ri);
+                if self.selected_route == Some(ri) {
+                    self.selected_route = None;
+                }
+                self.status = "Removed a route option.".into();
+            }
+            self.recompute_drawn_stats();
+        }
+    }
+
+    /// Step back one drawing action: shrink the draft to the last checkpoint, or
+    /// remove the most recently finished route.
+    fn undo_draw(&mut self) {
+        if let Some(d) = &mut self.draft {
+            match d.checkpoints.pop() {
+                Some(cp) => {
+                    d.points.truncate(cp);
+                    if d.points.is_empty() {
+                        self.draft = None;
+                    }
+                }
+                None => self.draft = None,
+            }
+        } else if self.drawn_routes.pop().is_some() {
+            self.selected_route = None;
+            self.recompute_drawn_stats();
+            self.status = "Removed last route option.".into();
+        }
+    }
+
+    /// Dashed drawn routes, the live draft, and (for the selected route) vertex
+    /// handles, a length/points label, and rings on collected controls.
+    fn draw_drawn_routes(&self, painter: &egui::Painter, origin: egui::Pos2) {
+        let leg = self.effective_leg();
+        let scored = self.controls.iter().any(|c| c.score.is_some());
+        let width = (self.view.zoom * 6.0).clamp(1.5, 5.0);
+        for (i, r) in self.drawn_routes.iter().enumerate() {
+            if !self.route_visible(r, leg) {
+                continue;
+            }
+            let color = route_color(r, i);
+            let selected = self.selected_route == Some(i);
+            self.draw_dashed(painter, origin, &r.points, width, color, selected);
+
+            if selected && self.draw_mode {
+                for v in &r.points {
+                    let s = self.to_screen(origin, (v[0], v[1]));
+                    painter.circle_filled(s, 4.0, color);
+                    painter.circle_stroke(s, 4.0, Stroke::new(1.5, Color32::WHITE));
+                }
+            }
+            if let Some(mid) = route_midpoint_px(&r.points) {
+                let s = self.to_screen(origin, (mid[0], mid[1]));
+                let text = route_label(self.drawn_stats.get(i), scored);
+                draw_label(painter, s, &text);
+            }
+            if selected
+                && let Some(st) = self.drawn_stats.get(i)
+            {
+                for &ci in &st.collected {
+                    if let Some(c) = self.controls.get(ci) {
+                        let s = self.to_screen(origin, (c.image_px[0], c.image_px[1]));
+                        painter.circle_stroke(s, 13.0, Stroke::new(2.5, color));
+                    }
+                }
+            }
+        }
+        // The in-progress draft: committed vertices + live stroke + a rubber band
+        // to the cursor, in the next palette color.
+        if let Some(d) = &self.draft {
+            let color = crate::athlete::ATHLETE_COLORS
+                [self.drawn_routes.len() % crate::athlete::ATHLETE_COLORS.len()];
+            let mut pts = d.points.clone();
+            pts.extend(d.stroke.iter().copied());
+            if let Some(hp) = painter.ctx().pointer_hover_pos()
+                && d.stroke.is_empty()
+                && !pts.is_empty()
+            {
+                let img = self.to_image(origin, hp);
+                pts.push([img.0, img.1]);
+            }
+            self.draw_dashed(painter, origin, &pts, width, color, true);
+            for v in &d.points {
+                let s = self.to_screen(origin, (v[0], v[1]));
+                painter.circle_filled(s, 4.0, color);
+            }
+        }
+    }
+
+    /// Draw a pixel-space polyline as a dashed screen line (a lone point as a dot),
+    /// with a faint white under-stroke when selected.
+    fn draw_dashed(
+        &self,
+        painter: &egui::Painter,
+        origin: egui::Pos2,
+        pts: &[[f64; 2]],
+        width: f32,
+        color: Color32,
+        selected: bool,
+    ) {
+        let screen: Vec<egui::Pos2> =
+            pts.iter().map(|v| self.to_screen(origin, (v[0], v[1]))).collect();
+        if screen.len() < 2 {
+            if let Some(&s) = screen.first() {
+                painter.circle_filled(s, width.max(2.0), color);
+            }
+            return;
+        }
+        if selected {
+            painter.add(Shape::line(
+                screen.clone(),
+                Stroke::new(width + 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)),
+            ));
+        }
+        let dash = (width * 2.0).max(8.0);
+        let gap = width.max(5.0);
+        painter.extend(Shape::dashed_line(&screen, Stroke::new(width, color), dash, gap));
     }
 
     fn draw_map(&self, painter: &egui::Painter, origin: egui::Pos2) {
@@ -772,6 +1158,15 @@ impl App {
                 FontId::proportional(11.0),
                 text_color,
             );
+            if let Some(score) = c.score {
+                painter.text(
+                    s + vec2(0.0, r + 1.0),
+                    Align2::CENTER_TOP,
+                    format!("{score}p"),
+                    FontId::proportional(10.0),
+                    Color32::from_rgb(255, 220, 120),
+                );
+            }
             if relevant
                 && let Some(a) = self.active()
                 && a.transform.is_some()
@@ -781,6 +1176,39 @@ impl App {
             }
         }
     }
+}
+
+/// Squared distance between two image-pixel points.
+fn dist2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
+}
+
+/// A drawn route's on-map label: its length, plus points and points/km when the
+/// course is scored (rogaine).
+fn route_label(stats: Option<&crate::analysis::RouteStats>, scored: bool) -> String {
+    let Some(s) = stats else {
+        return "— m".into();
+    };
+    let len = s
+        .length_m
+        .map(|m| format!("{m:.0} m"))
+        .unwrap_or_else(|| "— m".into());
+    if scored && s.points > 0 {
+        match s.length_m.filter(|&m| m > 0.0) {
+            Some(m) => format!("{len} · {} p · {:.1} p/km", s.points, s.points as f64 / (m / 1000.0)),
+            None => format!("{len} · {} p", s.points),
+        }
+    } else {
+        len
+    }
+}
+
+/// A small text label with a dark rounded backing, centered on `pos`.
+fn draw_label(painter: &egui::Painter, pos: egui::Pos2, text: &str) {
+    let galley = painter.layout_no_wrap(text.to_owned(), FontId::proportional(12.0), Color32::WHITE);
+    let rect = Rect::from_center_size(pos, galley.size() + vec2(8.0, 4.0));
+    painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 190));
+    painter.galley(rect.min + vec2(4.0, 2.0), galley, Color32::WHITE);
 }
 
 /// Wrap an angle (radians) into `(-π, π]`, so accumulated 90° taps stay in a tidy

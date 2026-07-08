@@ -7,7 +7,7 @@ pub mod track_import;
 
 pub use course_import::parse_iof_course;
 pub use export::render_png;
-pub use georef::{MapGeoref, detect_georef};
+pub use georef::{Crs, MapGeoref, detect_georef};
 pub use image_import::load_image;
 pub use project_file::{ProjectBundle, read_bundle, write_bundle};
 pub use track_import::parse_track;

@@ -14,6 +14,36 @@ pub struct CalibrationPoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoursePoint {
     pub image_px: [f64; 2],
+    /// Point value for score-O / rogaine courses. `None` for a plain control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<u32>,
+}
+
+impl CoursePoint {
+    /// A control at an image-pixel position, with no score.
+    pub fn at(x: f64, y: f64) -> Self {
+        Self {
+            image_px: [x, y],
+            score: None,
+        }
+    }
+}
+
+/// A user-drawn route option, a polyline in original-image pixel coordinates.
+/// Length and collected controls are derived at runtime, not stored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DrawnRoute {
+    pub points: Vec<[f64; 2]>,
+    /// The course leg this variant belongs to (0-based, `selected_leg` indexing);
+    /// `None` for a free-form measuring route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg: Option<usize>,
+    /// Optional user label; empty means auto-name ("A", "B", … / "Route n").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Optional override color; `None` cycles a palette by index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
 }
 
 /// V1 only: a control attached to a waypoint of the (single) track. Kept so old
@@ -95,6 +125,10 @@ pub struct ProjectFileV2 {
     /// Absent in projects saved before georeferencing support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub georef: Option<GeorefFile>,
+    /// User-drawn route options (analysis board). Absent in projects saved before
+    /// the feature; empty projects serialize the same as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<DrawnRoute>,
 }
 
 /// The original single-track schema, kept so pre-multi-athlete projects still open.
@@ -170,5 +204,65 @@ mod tests {
         };
         assert_eq!(p.athletes[0].name, "Anna");
         assert_eq!(p.controls[0].image_px, [10.0, 20.0]);
+        // Fields added after this schema default cleanly for old files.
+        assert!(p.routes.is_empty());
+        assert!(p.controls[0].score.is_none());
+    }
+
+    #[test]
+    fn empty_routes_and_scoreless_controls_omit_their_keys() {
+        // Byte-compat: a project with no routes and no scores must serialize the
+        // same as before those fields existed.
+        let p = ProjectFileV2 {
+            version: 2,
+            image_name: "map.png".into(),
+            athletes: vec![],
+            controls: vec![CoursePoint::at(1.0, 2.0)],
+            active: 0,
+            view: ViewState::default(),
+            georef: None,
+            routes: Vec::new(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("routes"), "{json}");
+        assert!(!json.contains("score"), "{json}");
+    }
+
+    #[test]
+    fn routes_and_scores_round_trip() {
+        let p = ProjectFileV2 {
+            version: 2,
+            image_name: "map.png".into(),
+            athletes: vec![],
+            controls: vec![CoursePoint {
+                image_px: [1.0, 2.0],
+                score: Some(30),
+            }],
+            active: 0,
+            view: ViewState::default(),
+            georef: None,
+            routes: vec![
+                DrawnRoute {
+                    points: vec![[0.0, 0.0], [5.0, 5.0]],
+                    leg: Some(2),
+                    name: String::new(),
+                    color: Some([10, 20, 30]),
+                },
+                DrawnRoute {
+                    points: vec![[1.0, 1.0], [2.0, 2.0], [3.0, 1.0]],
+                    leg: None,
+                    name: "Long way".into(),
+                    color: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ProjectFileV2 = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.controls[0].score, Some(30));
+        assert_eq!(back.routes.len(), 2);
+        assert_eq!(back.routes[0].leg, Some(2));
+        assert_eq!(back.routes[0].color, Some([10, 20, 30]));
+        assert_eq!(back.routes[1].name, "Long way");
+        assert!(back.routes[1].leg.is_none());
     }
 }
