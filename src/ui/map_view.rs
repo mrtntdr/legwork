@@ -31,6 +31,7 @@ impl App {
                     self.status = "Undid last calibration point.".into();
                 }
             }
+            self.apply_pending_rotation(rect);
             self.maybe_fit_view(rect);
             self.handle_zoom_pan(ui, &resp, origin);
             self.handle_interaction(&resp, origin);
@@ -110,15 +111,48 @@ impl App {
             }
         };
         let (rw, rh) = (rect.width() as f64, rect.height() as f64);
-        let zoom = ((rw / bw).min(rh / bh) * (1.0 - margin)).clamp(0.005, 200.0) as f32;
-        // Center the box's center in the canvas.
-        let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
+        // The box, rotated by the current view angle, spans a larger screen-aligned
+        // rectangle; fit that so a rotated map/leg still lands fully inside the canvas.
+        let (s, c) = self.view.rotation.sin_cos();
+        let (s, c) = (s.abs() as f64, c.abs() as f64);
+        let span_w = c * bw + s * bh;
+        let span_h = s * bw + c * bh;
+        let zoom = ((rw / span_w).min(rh / span_h) * (1.0 - margin)).clamp(0.005, 200.0) as f32;
         self.view.zoom = zoom;
-        self.view.offset = [
-            rect.width() / 2.0 - cx as f32 * zoom,
-            rect.height() / 2.0 - cy as f32 * zoom,
-        ];
+        // Center the box's center in the canvas (accounting for rotation).
+        let center = rect.center();
+        self.center_on(rect.min, center, (bx + bw / 2.0, by + bh / 2.0));
         self.fit = None;
+    }
+
+    /// Apply a pending view rotation, pivoting about the canvas center so the map
+    /// spins in place rather than swinging off screen.
+    fn apply_pending_rotation(&mut self, rect: Rect) {
+        let Some(target) = self.pending_rotate else {
+            return;
+        };
+        if rect.width() <= 1.0 {
+            return; // No canvas yet — keep the request for a later frame.
+        }
+        self.pending_rotate = None;
+        let origin = rect.min;
+        let center = rect.center();
+        // The image point under the canvas center must stay put across the rotation.
+        let pivot = self.to_image(origin, center);
+        self.view.rotation = normalize_angle(target);
+        self.center_on(origin, center, pivot);
+    }
+
+    /// Set `view.offset` so image point `img` lands at screen point `at` under the
+    /// current zoom and rotation.
+    fn center_on(&mut self, origin: egui::Pos2, at: egui::Pos2, img: (f64, f64)) {
+        let (sin, cos) = self.view.rotation.sin_cos();
+        let x = img.0 as f32 * self.view.zoom;
+        let y = img.1 as f32 * self.view.zoom;
+        self.view.offset = [
+            at.x - origin.x - (cos * x - sin * y),
+            at.y - origin.y - (sin * x + cos * y),
+        ];
     }
 
     /// A row above the map to step through the course leg by leg: prev/next arrows,
@@ -462,17 +496,28 @@ impl App {
     }
 
     fn draw_map(&self, painter: &egui::Painter, origin: egui::Pos2) {
-        if let Some(map) = &self.map {
-            let min = self.to_screen(origin, (0.0, 0.0));
-            let max = self.to_screen(origin, (map.size[0] as f64, map.size[1] as f64));
-            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-            painter.image(
-                map.texture.id(),
-                Rect::from_min_max(min, max),
+        let Some(map) = &self.map else { return };
+        let (w, h) = (map.size[0] as f64, map.size[1] as f64);
+        // A textured quad through the four rotated image corners, so the map turns
+        // with the view (`painter.image` only draws axis-aligned rectangles).
+        let corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)];
+        let uvs = [
+            pos2(0.0, 0.0),
+            pos2(1.0, 0.0),
+            pos2(1.0, 1.0),
+            pos2(0.0, 1.0),
+        ];
+        let mut mesh = egui::Mesh::with_texture(map.texture.id());
+        for (corner, uv) in corners.iter().zip(uvs) {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: self.to_screen(origin, *corner),
                 uv,
-                Color32::WHITE,
-            );
+                color: Color32::WHITE,
+            });
         }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
     }
 
     /// All visible athletes' routes; the active one last (on top), optionally
@@ -736,4 +781,12 @@ impl App {
             }
         }
     }
+}
+
+/// Wrap an angle (radians) into `(-π, π]`, so accumulated 90° taps stay in a tidy
+/// range for the rotation slider.
+fn normalize_angle(a: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let a = a.rem_euclid(TAU);
+    if a > PI { a - TAU } else { a }
 }

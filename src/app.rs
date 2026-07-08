@@ -142,6 +142,9 @@ pub struct App {
     pub(crate) show_graphs: bool,
     /// A pending view fit, applied next frame; `None` at rest.
     pub(crate) fit: Option<FitRequest>,
+    /// A pending absolute view rotation (radians), applied next frame about the
+    /// canvas center once its rect is known; `None` at rest.
+    pub(crate) pending_rotate: Option<f32>,
     /// Selected leg for the on-map leg view (0-based leg index), or `None` for
     /// the whole-course view. Leg `li` runs from boundary `li` to `li + 1`.
     pub(crate) selected_leg: Option<usize>,
@@ -189,6 +192,7 @@ impl App {
             show_splits: false,
             show_graphs: false,
             fit: None,
+            pending_rotate: None,
             selected_leg: None,
             playback: Playback::default(),
             hover_km: None,
@@ -256,6 +260,8 @@ impl App {
                     bytes: loaded.bytes,
                 });
                 self.image_name = name;
+                self.view.rotation = 0.0;
+                self.pending_rotate = None;
                 self.fit = Some(FitRequest::Map);
                 self.status = match &georef {
                     Some(g) => format!("Loaded map ({w}x{h}) — georeferenced ({}).", g.describe()),
@@ -689,17 +695,37 @@ impl App {
     // --- Coordinate helpers --------------------------------------------------
 
     pub(crate) fn to_screen(&self, origin: Pos2, img: (f64, f64)) -> Pos2 {
+        let (sin, cos) = self.view.rotation.sin_cos();
+        let x = img.0 as f32 * self.view.zoom;
+        let y = img.1 as f32 * self.view.zoom;
         pos2(
-            origin.x + self.view.offset[0] + img.0 as f32 * self.view.zoom,
-            origin.y + self.view.offset[1] + img.1 as f32 * self.view.zoom,
+            origin.x + self.view.offset[0] + cos * x - sin * y,
+            origin.y + self.view.offset[1] + sin * x + cos * y,
         )
     }
 
     pub(crate) fn to_image(&self, origin: Pos2, s: Pos2) -> (f64, f64) {
+        let (sin, cos) = self.view.rotation.sin_cos();
+        let dx = s.x - origin.x - self.view.offset[0];
+        let dy = s.y - origin.y - self.view.offset[1];
+        // Undo the rotation (transpose), then the zoom.
         (
-            ((s.x - origin.x - self.view.offset[0]) / self.view.zoom) as f64,
-            ((s.y - origin.y - self.view.offset[1]) / self.view.zoom) as f64,
+            ((cos * dx + sin * dy) / self.view.zoom) as f64,
+            ((-sin * dx + cos * dy) / self.view.zoom) as f64,
         )
+    }
+
+    /// Request a new absolute view rotation (radians, clockwise), applied next
+    /// frame about the canvas center once the canvas rect is known.
+    pub(crate) fn rotate_to(&mut self, angle: f32) {
+        self.pending_rotate = Some(angle);
+    }
+
+    /// Request a relative view rotation, stacking on any rotation already pending
+    /// this frame (so repeated 90° taps accumulate).
+    pub(crate) fn rotate_by(&mut self, delta: f32) {
+        let base = self.pending_rotate.unwrap_or(self.view.rotation);
+        self.pending_rotate = Some(base + delta);
     }
 
     /// Screen position of the active athlete's waypoint `i`, if a transform exists.

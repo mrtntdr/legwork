@@ -23,13 +23,18 @@ pub struct Control {
     pub track_index: usize,
 }
 
-/// Pan/zoom state for the map canvas, persisted so a reopened project looks the same.
+/// Pan/zoom/rotation state for the map canvas, persisted so a reopened project
+/// looks the same.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ViewState {
     /// Screen-space offset of the image origin (pixels).
     pub offset: [f32; 2],
     /// Image-pixel to screen-pixel scale.
     pub zoom: f32,
+    /// Clockwise view rotation, in radians. Absent in projects saved before map
+    /// rotation, where it defaults to 0 (north/image up).
+    #[serde(default)]
+    pub rotation: f32,
 }
 
 impl Default for ViewState {
@@ -37,6 +42,7 @@ impl Default for ViewState {
         Self {
             offset: [0.0, 0.0],
             zoom: 1.0,
+            rotation: 0.0,
         }
     }
 }

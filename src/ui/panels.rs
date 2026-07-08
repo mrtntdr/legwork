@@ -152,9 +152,48 @@ impl App {
             ui.label("No track loaded.");
         }
 
+        self.map_section(ui);
+
         match self.mode {
             EditMode::Calibrate => self.calibration_section(ui),
             EditMode::Control => self.course_section(ui),
+        }
+    }
+
+    /// Map orientation controls (Setup): rotate the whole view in 90° steps or by a
+    /// fine angle, so a sideways photo/scan can be turned upright. Routes, controls
+    /// and pins rotate with the map, and the angle is saved with the project.
+    fn map_section(&mut self, ui: &mut egui::Ui) {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        if self.map.is_none() {
+            return;
+        }
+        ui.separator();
+        ui.heading("Map");
+        ui.horizontal(|ui| {
+            ui.label("Rotate");
+            if ui.button("⟲").on_hover_text("Rotate 90° left").clicked() {
+                self.rotate_by(-FRAC_PI_2);
+            }
+            if ui.button("⟳").on_hover_text("Rotate 90° right").clicked() {
+                self.rotate_by(FRAC_PI_2);
+            }
+            if ui
+                .add_enabled(self.view.rotation != 0.0, egui::Button::new("Reset"))
+                .on_hover_text("Back to image-up")
+                .clicked()
+            {
+                self.rotate_to(0.0);
+            }
+        });
+        let mut deg = self.view.rotation.to_degrees();
+        let range = (-PI).to_degrees()..=PI.to_degrees();
+        if ui
+            .add(egui::Slider::new(&mut deg, range).suffix("°").text("angle"))
+            .on_hover_text("Fine rotation to straighten an angled photo")
+            .changed()
+        {
+            self.rotate_to(deg.to_radians());
         }
     }
 

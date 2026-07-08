@@ -142,6 +142,7 @@ mod tests {
                 view: ViewState {
                     offset: [10.0, -20.0],
                     zoom: 1.5,
+                    rotation: 0.0,
                 },
                 georef: Some(crate::model::GeorefFile {
                     px_to_world: [2.0, 0.0, 650000.0, 0.0, -2.0, 6580000.0],

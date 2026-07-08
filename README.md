@@ -21,6 +21,9 @@ Pre-built files for Mac and Windows can be found under the relases: [https://git
 ### Setup
 
 - **Map image**: open JPEG / PNG / GIF / TIFF / BMP / WebP; pan & zoom canvas.
+- **Rotate**: turn a sideways or angled photo/scan upright — ⟲/⟳ in 90° steps or a
+  fine-angle slider (**Setup → Map**). The whole scene (routes, controls, pins)
+  rotates about the canvas center, and the angle is saved with the project.
 - **Georeferenced maps**: a world-file sidecar (`.pgw`/`.jgw`/`.tfw`/`.wld`, with an
   optional `.prj`) or embedded **GeoTIFF** tags are detected automatically when a map
   is opened — every track then lands on the map with **no manual calibration**.
