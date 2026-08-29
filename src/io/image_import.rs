@@ -9,12 +9,32 @@ pub struct LoadedImage {
 }
 
 /// Decode encoded image bytes (jpeg/png/gif/tiff/bmp/webp) into an egui image.
+///
+/// `size` is always the original pixel dimensions — the coordinate space controls
+/// and calibration pins live in — even when the texture is downscaled for the GPU.
 pub fn load_image(bytes: Vec<u8>) -> Result<LoadedImage, String> {
     let dynamic =
         image::load_from_memory(&bytes).map_err(|e| format!("Failed to decode image: {e}"))?;
+    let size = [dynamic.width() as usize, dynamic.height() as usize];
+
+    // Mobile/WebGL commonly caps textures at 4096² and rejects larger uploads with a
+    // black map. Downscale the texture pixels to fit (aspect preserved); the quad is
+    // still drawn at the original `size`, so the (blurrier) texture just stretches
+    // over it and image-pixel coordinates stay exact. The original `bytes` are kept
+    // verbatim for lossless save/export.
+    #[cfg(target_arch = "wasm32")]
+    let dynamic = {
+        const MAX_TEX: u32 = 4096;
+        if dynamic.width() > MAX_TEX || dynamic.height() > MAX_TEX {
+            dynamic.resize(MAX_TEX, MAX_TEX, image::imageops::FilterType::Triangle)
+        } else {
+            dynamic
+        }
+    };
+
     let rgba = dynamic.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let color_image = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    let tex_size = [rgba.width() as usize, rgba.height() as usize];
+    let color_image = ColorImage::from_rgba_unmultiplied(tex_size, rgba.as_raw());
     Ok(LoadedImage {
         color_image,
         size,

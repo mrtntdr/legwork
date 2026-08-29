@@ -1,13 +1,11 @@
 use crate::analysis::{compare, fmt_duration, fmt_pace, leg_label, quickness_color};
 use crate::app::{App, EditMode, FitRequest, ViewTab};
 use crate::athlete::route_color;
+use crate::platform::FileRequest;
 use egui::{Color32, RichText};
 
 /// Highlight color for the best (fastest) athlete in the leg summary.
 const BEST_GREEN: Color32 = Color32::from_rgb(80, 210, 120);
-
-const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "tiff", "tif", "bmp", "webp"];
-const TRACK_EXTS: &[&str] = &["gpx", "tcx", "xml"];
 
 /// Coloring palette handle colors and their minimum separation (min/km).
 const QUICK_RED: egui::Color32 = egui::Color32::from_rgb(240, 70, 70);
@@ -60,67 +58,37 @@ impl App {
     /// All file operations in one place, so the top bar stays about the two
     /// activities rather than a row of dialogs.
     fn file_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("File", |ui| {
-            if ui.button("Open Map…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Images", IMAGE_EXTS)
-                    .pick_file()
-                && let Ok(bytes) = std::fs::read(&path)
-            {
-                let name = file_name(&path);
-                // World-file sidecar or embedded GeoTIFF tags, when present, let
-                // tracks and IOF courses land on the map with no calibration.
-                let georef = crate::io::detect_georef(&path, &bytes);
-                let ctx = ui.ctx().clone();
-                self.load_image_from_bytes(&ctx, bytes, name, georef);
+        ui.menu_button("File", |ui| self.file_menu_items(ui));
+    }
+
+    /// The File menu entries, shared by the desktop "File" button and the mobile
+    /// top bar's ☰ button.
+    pub(crate) fn file_menu_items(&mut self, ui: &mut egui::Ui) {
+        {
+            if ui.button("Open Map…").clicked() {
+                self.request_file(ui.ctx(), FileRequest::OpenMap);
             }
             if ui.button("Add Track…").clicked() {
-                self.add_athlete_dialog();
+                self.request_file(ui.ctx(), FileRequest::AddTrack);
             }
             if ui
                 .button("Import Course…")
                 .on_hover_text("IOF XML 3.0 course file (OCAD, Purple Pen, Condes)")
                 .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("IOF XML course", &["xml"])
-                    .pick_file()
-                && let Ok(bytes) = std::fs::read(&path)
             {
-                self.import_course(&bytes);
+                self.request_file(ui.ctx(), FileRequest::ImportCourse);
             }
             ui.separator();
-            if ui.button("Open Project…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Legwork project", &["legit", "route"])
-                    .pick_file()
-            {
-                let ctx = ui.ctx().clone();
-                self.open_project(&ctx, path);
+            if ui.button("Open Project…").clicked() {
+                self.request_file(ui.ctx(), FileRequest::OpenProject);
             }
-            if ui.button("Save Project…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Legwork project", &["legit"])
-                    .set_file_name("analysis.legit")
-                    .save_file()
-            {
-                self.save_project(path);
+            if ui.button("Save Project…").clicked() {
+                self.save_project();
             }
             ui.separator();
             if ui.button("Export PNG…").clicked() {
                 self.export_png();
             }
-        });
-    }
-
-    /// Pick a GPX/TCX file and add it as a new athlete.
-    fn add_athlete_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("GPX/TCX", TRACK_EXTS)
-            .pick_file()
-            && let Ok(bytes) = std::fs::read(&path)
-        {
-            let name = file_name(&path);
-            self.add_athlete(bytes, name);
         }
     }
 
@@ -135,7 +103,7 @@ impl App {
 
     /// Setup: full athlete management, the active track's stats, and the details
     /// of whichever edit mode is active (calibration or course).
-    fn setup_side_panel(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn setup_side_panel(&mut self, ui: &mut egui::Ui) {
         self.athletes_section(ui, true);
 
         ui.separator();
@@ -201,7 +169,7 @@ impl App {
     /// Analysis: a compact athlete list (visibility + active pick), route coloring
     /// (only while pace colors are in use), and either the overall leaderboard
     /// (whole course) or the selected-leg summary. Nothing that edits the project.
-    fn analysis_side_panel(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn analysis_side_panel(&mut self, ui: &mut egui::Ui) {
         self.athletes_section(ui, false);
         if self.active_pace_colors {
             self.coloring_controls(ui);
@@ -583,7 +551,7 @@ impl App {
         }
         if full {
             if ui.button("Add Athlete…").clicked() {
-                self.add_athlete_dialog();
+                self.request_file(ui.ctx(), FileRequest::AddTrack);
             }
             if self.athletes.is_empty() {
                 ui.label(
@@ -811,12 +779,6 @@ impl App {
     }
 }
 
-fn file_name(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".into())
-}
-
 /// The label shown for a drawn route: its user name, else an auto-name — a variant
 /// letter per leg ("2–3 A"), or "Route n" for a free-form route. `n` is the
 /// route's position within the list currently shown.
@@ -860,11 +822,5 @@ mod tests {
         // The low end never goes below zero pace.
         let (lo, _) = reframe_palette(0.05, 0.2);
         assert!(lo >= 0.0);
-    }
-
-    #[test]
-    fn file_name_falls_back_when_pathless() {
-        assert_eq!(file_name(std::path::Path::new("/a/b/run.gpx")), "run.gpx");
-        assert_eq!(file_name(std::path::Path::new("/")), "file");
     }
 }

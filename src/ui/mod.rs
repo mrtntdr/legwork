@@ -1,12 +1,15 @@
 mod graphs;
 mod leg_analysis;
 mod map_view;
+mod mobile;
 mod panels;
 mod playback;
+pub(crate) mod touch;
 
 use crate::analysis::color_for;
 use crate::app::App;
 use crate::io;
+use crate::platform::{self, SaveKind};
 
 impl App {
     /// Render the current map with every visible athlete's route (and the shared
@@ -51,18 +54,11 @@ impl App {
             .collect();
 
         match io::render_png(&map.bytes, &segments, &markers) {
-            Ok(png) => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("PNG", &["png"])
-                    .set_file_name("route.png")
-                    .save_file()
-                {
-                    match std::fs::write(&path, png) {
-                        Ok(()) => self.status = "Exported PNG.".into(),
-                        Err(e) => self.status = format!("Export failed: {e}"),
-                    }
-                }
-            }
+            Ok(png) => match platform::save_file(SaveKind::Png, "route.png", png) {
+                Ok(true) => self.status = "Exported PNG.".into(),
+                Ok(false) => {} // cancelled
+                Err(e) => self.status = format!("Export failed: {e}"),
+            },
             Err(e) => self.status = format!("Export failed: {e}"),
         }
     }

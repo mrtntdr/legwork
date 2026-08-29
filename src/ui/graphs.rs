@@ -18,7 +18,17 @@ impl App {
         if !self.show_graphs {
             return;
         }
+        egui::Panel::bottom("graphs")
+            .default_size(320.0)
+            .resizable(true)
+            .show(ui, |ui| self.graphs_content(ui));
+    }
+
+    /// The graphs stack itself (header toggles + the pace/HR/elevation plots),
+    /// panel-free so it can render in the desktop drawer or a mobile bottom sheet.
+    pub(crate) fn graphs_content(&mut self, ui: &mut egui::Ui) {
         let Some(data) = self.build_graph_data() else {
+            ui.label(egui::RichText::new("Add a track (with timestamps) to graph.").weak());
             return;
         };
         let GraphData {
@@ -41,59 +51,54 @@ impl App {
 
         let mut hovered: Option<f64> = None;
         let mut pace_cap = self.pace_cap_minkm;
-        egui::Panel::bottom("graphs")
-            .default_size(320.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("Graphs");
-                    ui.checkbox(&mut self.show_pace, "Pace");
-                    ui.checkbox(&mut self.show_hr, "Heart rate");
-                    ui.checkbox(&mut self.show_ele, "Elevation");
-                });
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if show_pace {
-                        hovered = hovered.or(draw_pace_plot(
-                            ui,
-                            &pace_pts,
-                            &pace_colors,
-                            &marks,
-                            pace_cutoffs_minkm,
-                            cursor,
-                            &mut pace_cap,
-                            dist_on_pace,
-                        ));
-                        ui.add_space(6.0);
-                    }
-                    if hr_shown {
-                        hovered = hovered.or(draw_plot(
-                            ui,
-                            "Heart rate (bpm)",
-                            78.0,
-                            &hr_pts,
-                            HR_COLOR,
-                            &marks,
-                            cursor,
-                            &|v| format!("{v:.0} bpm"),
-                            dist_on_hr,
-                        ));
-                        ui.add_space(6.0);
-                    }
-                    if ele_shown {
-                        hovered = hovered.or(draw_plot(
-                            ui,
-                            "Elevation (m)",
-                            78.0,
-                            &ele_pts,
-                            ELE_COLOR,
-                            &marks,
-                            cursor,
-                            &|v| format!("{v:.0} m"),
-                            dist_on_ele,
-                        ));
-                    }
-                });
-            });
+        ui.horizontal(|ui| {
+            ui.strong("Graphs");
+            ui.checkbox(&mut self.show_pace, "Pace");
+            ui.checkbox(&mut self.show_hr, "Heart rate");
+            ui.checkbox(&mut self.show_ele, "Elevation");
+        });
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if show_pace {
+                hovered = hovered.or(draw_pace_plot(
+                    ui,
+                    &pace_pts,
+                    &pace_colors,
+                    &marks,
+                    pace_cutoffs_minkm,
+                    cursor,
+                    &mut pace_cap,
+                    dist_on_pace,
+                ));
+                ui.add_space(6.0);
+            }
+            if hr_shown {
+                hovered = hovered.or(draw_plot(
+                    ui,
+                    "Heart rate (bpm)",
+                    78.0,
+                    &hr_pts,
+                    HR_COLOR,
+                    &marks,
+                    cursor,
+                    &|v| format!("{v:.0} bpm"),
+                    dist_on_hr,
+                ));
+                ui.add_space(6.0);
+            }
+            if ele_shown {
+                hovered = hovered.or(draw_plot(
+                    ui,
+                    "Elevation (m)",
+                    78.0,
+                    &ele_pts,
+                    ELE_COLOR,
+                    &marks,
+                    cursor,
+                    &|v| format!("{v:.0} m"),
+                    dist_on_ele,
+                ));
+            }
+        });
         self.pace_cap_minkm = pace_cap;
         if hovered.is_some() {
             self.pending_hover = hovered;

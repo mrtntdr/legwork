@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Legwork — orienteering analysis</title>
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#1e1e1e" />
+
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <link data-trunk rel="copy-file" href="manifest.json" />
+    <link data-trunk rel="copy-file" href="sw.js" />
+    <link data-trunk rel="copy-file" href="icon-192.png" />
+    <link data-trunk rel="copy-file" href="icon-512.png" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="apple-touch-icon" href="icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #1e1e1e;
+        /* Fill the notch/safe areas on phones. */
+        position: fixed;
+        overscroll-behavior: none;
+      }
+      /* The map lives here; block the browser's own pan/zoom/pull-to-refresh so
+         all touch gestures reach egui instead. */
+      canvas#legwork_canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        touch-action: none;
+        outline: none;
+      }
+      /* Simple centered loading text until the wasm module boots. */
+      #loading {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #888;
+        font-family: system-ui, sans-serif;
+        font-size: 15px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="loading">Loading Legwork…</div>
+    <canvas id="legwork_canvas"></canvas>
+    <script>
+      // Hide the loading text once the canvas has been painted at least once.
+      const canvas = document.getElementById("legwork_canvas");
+      const observer = new MutationObserver(() => {});
+      // eframe sets the canvas size on start; poll briefly to drop the splash.
+      const drop = () => {
+        const el = document.getElementById("loading");
+        if (el && canvas.width > 0) el.remove();
+        else setTimeout(drop, 200);
+      };
+      setTimeout(drop, 200);
+
+      // Register the service worker for offline / installable use (best-effort).
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("sw.js").catch(() => {});
+        });
+      }
+    </script>
+  </body>
+</html>

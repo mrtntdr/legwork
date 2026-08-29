@@ -16,44 +16,48 @@ impl App {
         egui::Panel::bottom("splits")
             .resizable(true)
             .default_size(230.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("Splits");
-                    ui.checkbox(&mut self.show_cumulative, "Cumulative times");
-                    if self.controls.is_empty() {
-                        ui.label(
-                            RichText::new(
-                                "place controls in Setup · Course to split the course into legs",
-                            )
-                            .weak(),
-                        );
-                    }
-                });
+            .show(ui, |ui| self.splits_content(ui));
+    }
 
-                let visible: Vec<usize> = (0..self.athletes.len())
-                    .filter(|&i| self.athletes[i].visible)
-                    .collect();
-                if visible.is_empty() {
-                    ui.label(
-                        RichText::new("Add a GPS track (and tick it visible) to compare legs.")
-                            .weak(),
-                    );
-                    return;
-                }
+    /// The splits header + comparison table, panel-free so it renders in the desktop
+    /// drawer or a mobile bottom sheet. The table is width-hungry (one column per
+    /// athlete), so callers on narrow screens wrap it in a horizontal scroll area.
+    pub(crate) fn splits_content(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Splits");
+            ui.checkbox(&mut self.show_cumulative, "Cumulative times");
+            if self.controls.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "place controls in Setup · Course to split the course into legs",
+                    )
+                    .weak(),
+                );
+            }
+        });
 
-                let boundaries: Vec<Vec<Option<usize>>> = visible
-                    .iter()
-                    .map(|&i| self.athletes[i].boundaries())
-                    .collect();
-                let entries: Vec<_> = visible
-                    .iter()
-                    .zip(&boundaries)
-                    .map(|(&i, b)| (&self.athletes[i].track, b.as_slice()))
-                    .collect();
-                let rows = compare(&entries, self.controls.len());
+        let visible: Vec<usize> = (0..self.athletes.len())
+            .filter(|&i| self.athletes[i].visible)
+            .collect();
+        if visible.is_empty() {
+            ui.label(
+                RichText::new("Add a GPS track (and tick it visible) to compare legs.").weak(),
+            );
+            return;
+        }
 
-                self.comparison_table(ui, &visible, &rows);
-            });
+        let boundaries: Vec<Vec<Option<usize>>> = visible
+            .iter()
+            .map(|&i| self.athletes[i].boundaries())
+            .collect();
+        let entries: Vec<_> = visible
+            .iter()
+            .zip(&boundaries)
+            .map(|(&i, b)| (&self.athletes[i].track, b.as_slice()))
+            .collect();
+        let rows = compare(&entries, self.controls.len());
+
+        self.comparison_table(ui, &visible, &rows);
     }
 
     fn comparison_table(&mut self, ui: &mut egui::Ui, visible: &[usize], rows: &[LegRow]) {

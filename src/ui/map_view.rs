@@ -42,7 +42,16 @@ impl App {
             }
             self.apply_pending_rotation(rect);
             self.maybe_fit_view(rect);
+            self.handle_touch_gestures(ui, origin);
             self.handle_zoom_pan(ui, &resp, origin);
+            // A fresh press clears any stale tap-swallow; a long-press (touch's
+            // right-click) then edits and swallows the release tap.
+            if ui.input(|i| i.pointer.any_pressed()) {
+                self.swallow_tap = false;
+            }
+            if let Some(lp) = self.long_press.update(ui, &resp) {
+                self.on_long_press(origin, lp);
+            }
             self.handle_interaction(&resp, origin);
             self.hover_route(&resp, origin);
 
@@ -277,6 +286,11 @@ impl App {
     /// Zoom is always anchored on the pointer so the map feature under the cursor
     /// stays put.
     fn handle_zoom_pan(&mut self, ui: &egui::Ui, resp: &egui::Response, origin: egui::Pos2) {
+        // A live touchscreen pinch/rotate is handled by `handle_touch_gestures`;
+        // `zoom_delta()` here would double-count it.
+        if ui.ctx().input(|i| i.multi_touch()).is_some() {
+            return;
+        }
         if !resp.hovered() {
             return;
         }
@@ -308,17 +322,88 @@ impl App {
 
         // Zoom (pinch / Ctrl+scroll / mouse wheel), anchored on the pointer.
         let factor = pinch * (wheel_zoom * 0.0015).exp();
-        if factor != 1.0 {
-            let img_before = self.to_image(origin, p);
-            self.view.zoom = (self.view.zoom * factor).clamp(0.005, 200.0);
-            let after = self.to_screen(origin, img_before);
-            self.view.offset[0] += p.x - after.x;
-            self.view.offset[1] += p.y - after.y;
-        }
+        self.zoom_about(origin, p, factor);
 
         // Pan from a two-finger swipe.
         self.view.offset[0] += pan.x;
         self.view.offset[1] += pan.y;
+    }
+
+    /// Two-finger touch gestures: pinch-zoom, twist-rotate and drag-pan the map,
+    /// all anchored on the gesture centroid. Sets `gesturing` so single-pointer
+    /// editing (which egui synthesizes from the first touch) is suppressed and any
+    /// in-flight edit drag is cancelled.
+    fn handle_touch_gestures(&mut self, ui: &egui::Ui, origin: egui::Pos2) {
+        if let Some(mt) = ui.ctx().input(|i| i.multi_touch()) {
+            if !self.gesturing {
+                self.cancel_drag();
+            }
+            let anchor = mt.center_pos;
+            self.zoom_about(origin, anchor, mt.zoom_delta);
+            self.rotate_about(origin, anchor, mt.rotation_delta);
+            self.view.offset[0] += mt.translation_delta.x;
+            self.view.offset[1] += mt.translation_delta.y;
+            self.gesturing = true;
+        } else if !ui.input(|i| i.pointer.any_down()) {
+            // Only clear once every finger is lifted, so a leftover finger after a
+            // pinch doesn't immediately resume editing.
+            self.gesturing = false;
+        }
+    }
+
+    /// Multiply the zoom by `factor`, keeping the map feature under `anchor` fixed.
+    fn zoom_about(&mut self, origin: egui::Pos2, anchor: egui::Pos2, factor: f32) {
+        if factor == 1.0 {
+            return;
+        }
+        let img_before = self.to_image(origin, anchor);
+        self.view.zoom = (self.view.zoom * factor).clamp(0.005, 200.0);
+        let after = self.to_screen(origin, img_before);
+        self.view.offset[0] += anchor.x - after.x;
+        self.view.offset[1] += anchor.y - after.y;
+    }
+
+    /// Rotate the view by `delta` radians about the map feature under `anchor`
+    /// (unlike the side-panel rotate, which pivots on the canvas center).
+    fn rotate_about(&mut self, origin: egui::Pos2, anchor: egui::Pos2, delta: f32) {
+        if delta == 0.0 {
+            return;
+        }
+        let pivot = self.to_image(origin, anchor);
+        self.view.rotation = normalize_angle(self.view.rotation + delta);
+        self.center_on(origin, anchor, pivot);
+    }
+
+    /// Drop any in-flight edit drag (used when a multi-touch gesture takes over).
+    fn cancel_drag(&mut self) {
+        if matches!(self.drag, Some(DragTarget::RouteSketch))
+            && let Some(d) = &mut self.draft
+        {
+            d.stroke.clear();
+        }
+        self.drag = None;
+    }
+
+    /// Finger-sized hit radius for markers when driving by touch.
+    fn hit_radius(&self) -> f32 {
+        if self.touch { 24.0 } else { HIT_RADIUS }
+    }
+
+    /// Finger-sized snap radius (create-pin / remove / end-snap) when on touch.
+    fn snap_radius(&self) -> f32 {
+        if self.touch { 56.0 } else { SNAP_RADIUS }
+    }
+
+    /// The image position a touch drag should place a grabbed marker at: the
+    /// fingertip plus the grab offset, lifted above the finger so the target isn't
+    /// hidden under it. On mouse it's just the pointer.
+    fn drag_pos(&self, resp: &egui::Response) -> Option<egui::Pos2> {
+        let p = resp.interact_pointer_pos()?;
+        Some(if self.touch {
+            p + self.grab_offset + vec2(0.0, -44.0)
+        } else {
+            p
+        })
     }
 
     fn pan(&mut self, resp: &egui::Response) {
@@ -342,6 +427,10 @@ impl App {
     }
 
     fn handle_interaction(&mut self, resp: &egui::Response, origin: egui::Pos2) {
+        // A two-finger gesture owns the map this frame; don't also edit.
+        if self.gesturing {
+            return;
+        }
         match self.tab {
             // Setup: the map is editable via the current mode.
             ViewTab::Setup => match self.mode {
@@ -355,7 +444,14 @@ impl App {
                 if resp.dragged() {
                     self.pan(resp);
                 }
-                if resp.clicked()
+                // Double-tap to zoom in on empty map (not on a control).
+                if self.touch
+                    && resp.double_clicked()
+                    && let Some(p) = resp.interact_pointer_pos()
+                    && self.control_at(origin, p).is_none()
+                {
+                    self.zoom_about(origin, p, 2.0);
+                } else if resp.clicked()
                     && let Some(p) = resp.interact_pointer_pos()
                     && let Some(k) = self.control_at(origin, p)
                 {
@@ -375,14 +471,18 @@ impl App {
             && let Some(p) = resp.interact_pointer_pos()
         {
             self.drag = Some(match self.control_at(origin, p) {
-                Some(i) => DragTarget::Control(i),
+                Some(i) => {
+                    let c = self.controls[i].image_px;
+                    self.grab_offset = self.to_screen(origin, (c[0], c[1])) - p;
+                    DragTarget::Control(i)
+                }
                 None => DragTarget::View,
             });
         }
         if resp.dragged() {
             match self.drag {
                 Some(DragTarget::Control(i)) => {
-                    if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(p) = self.drag_pos(resp) {
                         let img = self.to_image(origin, p);
                         if let Some(c) = self.controls.get_mut(i) {
                             c.image_px = [img.0, img.1];
@@ -396,7 +496,7 @@ impl App {
         if resp.drag_stopped() {
             self.drag = None;
         }
-        if resp.clicked() {
+        if resp.clicked() && !self.swallow_tap {
             self.handle_control_click(resp, origin);
         }
         if resp.secondary_clicked() {
@@ -429,28 +529,35 @@ impl App {
     /// Right-click removes the control nearest the cursor.
     fn remove_control_at(&mut self, resp: &egui::Response, origin: egui::Pos2) {
         if let Some(p) = resp.interact_pointer_pos() {
-            let best = self
-                .controls
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    let s = self.to_screen(origin, (c.image_px[0], c.image_px[1]));
-                    (i, (s - p).length())
-                })
-                .filter(|&(_, d)| d < SNAP_RADIUS)
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((i, _)) = best {
-                self.controls.remove(i);
-                self.rematch_all();
-                self.status = "Removed control.".into();
-            }
+            self.remove_control_near(origin, p);
+        }
+    }
+
+    /// Remove the control nearest a screen point, within the snap radius.
+    fn remove_control_near(&mut self, origin: egui::Pos2, p: egui::Pos2) {
+        let r = self.snap_radius();
+        let best = self
+            .controls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let s = self.to_screen(origin, (c.image_px[0], c.image_px[1]));
+                (i, (s - p).length())
+            })
+            .filter(|&(_, d)| d < r)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((i, _)) = best {
+            self.controls.remove(i);
+            self.rematch_all();
+            self.status = "Removed control.".into();
         }
     }
 
     /// Index of the course control under a screen point, if any.
     fn control_at(&self, origin: egui::Pos2, p: egui::Pos2) -> Option<usize> {
+        let r = self.hit_radius();
         self.controls.iter().position(|c| {
-            (self.to_screen(origin, (c.image_px[0], c.image_px[1])) - p).length() < HIT_RADIUS
+            (self.to_screen(origin, (c.image_px[0], c.image_px[1])) - p).length() < r
         })
     }
 
@@ -458,13 +565,8 @@ impl App {
         // Right-click a pin to remove it.
         if resp.secondary_clicked()
             && let Some(p) = resp.interact_pointer_pos()
-            && let Some(i) = self.pin_at(origin, p)
         {
-            if let Some(a) = self.active_mut() {
-                a.calibration.remove(i);
-            }
-            self.recompute_transform_active();
-            self.status = "Removed calibration point.".into();
+            self.remove_pin_at(origin, p);
             return;
         }
         // A press resolves to one of: grab an existing pin, create+lock a new pin on
@@ -477,7 +579,7 @@ impl App {
         if resp.dragged() {
             match self.drag {
                 Some(DragTarget::Calibration(i)) => {
-                    if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(p) = self.drag_pos(resp) {
                         let img = self.to_image(origin, p);
                         if let Some(c) = self.active_mut().and_then(|a| a.calibration.get_mut(i)) {
                             c.image_px = [img.0, img.1];
@@ -493,10 +595,22 @@ impl App {
         }
     }
 
+    /// Remove the active athlete's calibration pin at a screen point, if any.
+    fn remove_pin_at(&mut self, origin: egui::Pos2, p: egui::Pos2) {
+        if let Some(i) = self.pin_at(origin, p) {
+            if let Some(a) = self.active_mut() {
+                a.calibration.remove(i);
+            }
+            self.recompute_transform_active();
+            self.status = "Removed calibration point.".into();
+        }
+    }
+
     /// Index of the active athlete's calibration pin under a screen point, if any.
     fn pin_at(&self, origin: egui::Pos2, p: egui::Pos2) -> Option<usize> {
+        let r = self.hit_radius();
         self.active()?.calibration.iter().position(|c| {
-            (self.to_screen(origin, (c.image_px[0], c.image_px[1])) - p).length() < HIT_RADIUS
+            (self.to_screen(origin, (c.image_px[0], c.image_px[1])) - p).length() < r
         })
     }
 
@@ -504,13 +618,18 @@ impl App {
     fn begin_calibrate_drag(&mut self, origin: egui::Pos2, p: egui::Pos2) -> DragTarget {
         // 1. Re-grab an existing pin if the press landed on one.
         if let Some(i) = self.pin_at(origin, p) {
+            let px = self
+                .active()
+                .and_then(|a| a.calibration.get(i))
+                .map(|c| (c.image_px[0], c.image_px[1]));
+            self.grab_offset = px.map_or(egui::Vec2::ZERO, |px| self.to_screen(origin, px) - p);
             return DragTarget::Calibration(i);
         }
         // 2. Otherwise, if the press is on the active route, create a new pin locked
         //    to the nearest waypoint and drag it in the same gesture.
         if let Some(idx) = self.nearest_waypoint(origin, p)
             && let Some(s) = self.waypoint_screen(origin, idx)
-            && (s - p).length() < SNAP_RADIUS
+            && (s - p).length() < self.snap_radius()
         {
             let img = self.to_image(origin, p);
             let pin_index = self.active_mut().map(|a| {
@@ -521,6 +640,8 @@ impl App {
                 a.calibration.len() - 1
             });
             if let Some(i) = pin_index {
+                // A freshly-created pin sits at the fingertip; no grab offset.
+                self.grab_offset = egui::Vec2::ZERO;
                 self.recompute_transform_active();
                 self.status = "Drag onto the matching map feature, then release to lock.".into();
                 return DragTarget::Calibration(i);
@@ -528,6 +649,74 @@ impl App {
         }
         // 3. Empty space: pan.
         DragTarget::View
+    }
+
+    /// A long-press (the touch right-click) removes the marker under the finger in
+    /// whatever edit mode is active, then swallows the tap egui emits on release.
+    fn on_long_press(&mut self, origin: egui::Pos2, p: egui::Pos2) {
+        match self.tab {
+            ViewTab::Setup if self.mode == EditMode::Calibrate => {
+                self.remove_pin_at(origin, p);
+                self.swallow_tap = true;
+                self.cancel_drag();
+            }
+            ViewTab::Setup => {
+                self.remove_control_near(origin, p);
+                self.swallow_tap = true;
+                self.cancel_drag();
+            }
+            ViewTab::Analysis if self.draw_mode => {
+                self.delete_route_vertex_at(origin, p);
+                self.swallow_tap = true;
+                self.cancel_drag();
+            }
+            _ => {}
+        }
+    }
+
+    /// On-screen action buttons for touch, replacing the keyboard shortcuts the map
+    /// relies on (undo, finish/cancel a route, fit). Anchored above the mobile
+    /// toolbar; only shown on touch.
+    pub(crate) fn map_fabs(&mut self, ctx: &egui::Context) {
+        if !self.touch {
+            return;
+        }
+        egui::Area::new(egui::Id::new("map_fabs"))
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-10.0, -70.0))
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    if self.tab == ViewTab::Analysis && self.draw_mode {
+                        let can_finish = self.draft.as_ref().is_some_and(|d| d.points.len() >= 2);
+                        if ui
+                            .add_enabled(can_finish, egui::Button::new("Finish"))
+                            .clicked()
+                            && let Some(d) = self.draft.take()
+                        {
+                            self.finish_route(d);
+                        }
+                        if ui.button("Undo").clicked() {
+                            self.undo_draw();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            if self.draft.is_some() {
+                                self.draft = None;
+                            } else {
+                                self.draw_mode = false;
+                            }
+                        }
+                    } else if self.tab == ViewTab::Setup
+                        && self.mode == EditMode::Calibrate
+                        && ui.button("Undo pin").clicked()
+                        && self.active_mut().is_some_and(|a| a.calibration.pop().is_some())
+                    {
+                        self.recompute_transform_active();
+                        self.status = "Undid last calibration point.".into();
+                    }
+                    if ui.button("Fit").clicked() {
+                        self.fit = Some(FitRequest::Map);
+                    }
+                });
+            });
     }
 
     // --- Draw mode (route options) -------------------------------------------
@@ -559,12 +748,13 @@ impl App {
     /// The finished-route vertex under a screen point, if any (route, vertex).
     fn route_vertex_at(&self, origin: egui::Pos2, p: egui::Pos2) -> Option<(usize, usize)> {
         let leg = self.effective_leg();
+        let r_hit = self.hit_radius();
         for (ri, r) in self.drawn_routes.iter().enumerate() {
             if !self.route_visible(r, leg) {
                 continue;
             }
             for (vi, v) in r.points.iter().enumerate() {
-                if (self.to_screen(origin, (v[0], v[1])) - p).length() < HIT_RADIUS {
+                if (self.to_screen(origin, (v[0], v[1])) - p).length() < r_hit {
                     return Some((ri, vi));
                 }
             }
@@ -577,6 +767,7 @@ impl App {
     fn route_segment_at(&self, origin: egui::Pos2, p: egui::Pos2) -> Option<usize> {
         let leg = self.effective_leg();
         let mut best: Option<(usize, f64)> = None;
+        let r_hit = self.hit_radius() as f64;
         for (ri, r) in self.drawn_routes.iter().enumerate() {
             if !self.route_visible(r, leg) {
                 continue;
@@ -587,7 +778,7 @@ impl App {
                 let d = point_segment_dist([p.x as f64, p.y as f64], [a.x as f64, a.y as f64], [
                     b.x as f64, b.y as f64,
                 ]);
-                if d < HIT_RADIUS as f64 && best.is_none_or(|(_, bd)| d < bd) {
+                if d < r_hit && best.is_none_or(|(_, bd)| d < bd) {
                     best = Some((ri, d));
                 }
             }
@@ -606,6 +797,8 @@ impl App {
                 && let Some((ri, vi)) = self.route_vertex_at(origin, p)
             {
                 self.selected_route = Some(ri);
+                let v = self.drawn_routes[ri].points[vi];
+                self.grab_offset = self.to_screen(origin, (v[0], v[1])) - p;
                 self.drag = Some(DragTarget::RouteVertex {
                     route: ri,
                     vertex: vi,
@@ -621,7 +814,7 @@ impl App {
         if resp.dragged() {
             match self.drag {
                 Some(DragTarget::RouteVertex { route, vertex }) => {
-                    if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(p) = self.drag_pos(resp) {
                         let img = self.to_image(origin, p);
                         if let Some(v) = self
                             .drawn_routes
@@ -667,6 +860,7 @@ impl App {
             return;
         }
         if resp.clicked()
+            && !self.swallow_tap
             && let Some(p) = resp.interact_pointer_pos()
         {
             if self.draft.is_none() {
@@ -722,7 +916,7 @@ impl App {
         }
         let leg = self.selected_leg;
         if let Some(li) = leg {
-            let snap = (SNAP_RADIUS as f64 / self.view.zoom as f64).max(1.0);
+            let snap = (self.snap_radius() as f64 / self.view.zoom as f64).max(1.0);
             let snap2 = snap * snap;
             let last = draft.points.len() - 1;
             if li >= 1
@@ -1063,6 +1257,34 @@ impl App {
     }
 
     fn draw_markers(&self, painter: &egui::Painter, origin: egui::Pos2) {
+        // Touch precision-drag guide: while dragging a marker with a finger, the
+        // marker rides above the fingertip; a thin line ties them together so it's
+        // clear what's being moved.
+        if self.touch
+            && let Some(fp) = painter.ctx().pointer_interact_pos()
+        {
+            let target = match self.drag {
+                Some(DragTarget::Control(i)) => {
+                    self.controls.get(i).map(|c| (c.image_px[0], c.image_px[1]))
+                }
+                Some(DragTarget::Calibration(i)) => self
+                    .active()
+                    .and_then(|a| a.calibration.get(i))
+                    .map(|c| (c.image_px[0], c.image_px[1])),
+                Some(DragTarget::RouteVertex { route, vertex }) => self
+                    .drawn_routes
+                    .get(route)
+                    .and_then(|r| r.points.get(vertex))
+                    .map(|v| (v[0], v[1])),
+                _ => None,
+            };
+            if let Some(t) = target {
+                let s = self.to_screen(origin, t);
+                painter.line_segment([fp, s], Stroke::new(1.0, Color32::from_white_alpha(140)));
+                painter.circle_stroke(s, 11.0, Stroke::new(2.0, Color32::from_rgb(0, 200, 255)));
+            }
+        }
+
         // Calibration pins: prominent locked markers (crosshair + ring) so it's clear
         // the route point is pinned to that exact map feature. Only the active
         // athlete's pins, and only while calibrating in Setup, to keep the map clean.

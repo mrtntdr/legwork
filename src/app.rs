@@ -7,9 +7,11 @@ use crate::geo::{Correspondence, LocalProjection, MapTransform, invert_transform
 use crate::io;
 use crate::io::{Crs, MapGeoref, ProjectBundle};
 use crate::model::{AthleteFile, CoursePoint, DrawnRoute, ProjectFileV2, ViewState, Waypoint, haversine};
+use crate::platform::{self, FileRequest, FileSender, PickedFile, SaveKind};
 use chrono::{DateTime, Utc};
 use egui::{Color32, Pos2, TextureHandle, pos2};
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 /// A decoded map image plus its GPU texture and original encoded bytes.
 pub struct MapImage {
@@ -32,6 +34,27 @@ pub enum ViewTab {
 pub enum EditMode {
     Calibrate,
     Control,
+}
+
+/// Screen width class, recomputed each frame. `Narrow` (a phone, or a very small
+/// window) switches to the map-first mobile layout: full-screen map with a single
+/// bottom sheet and a bottom toolbar instead of the desktop side panel + drawers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScreenClass {
+    Wide,
+    Narrow,
+}
+
+/// Which bottom sheet (if any) is open in the mobile layout. Only one is ever
+/// shown at a time so the map stays primary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MobileSheet {
+    None,
+    /// The side-panel content (athletes, calibration/course or analysis controls).
+    Panel,
+    Splits,
+    Graphs,
+    Transport,
 }
 
 /// What the active pointer drag is manipulating.
@@ -161,6 +184,24 @@ pub struct App {
     pub(crate) view: ViewState,
     pub(crate) mode: EditMode,
     pub(crate) drag: Option<DragTarget>,
+    /// True while a two-finger (multi-touch) gesture is driving the map, so
+    /// single-pointer editing is suppressed and any in-flight drag is cancelled.
+    pub(crate) gesturing: bool,
+    /// Screen offset from the fingertip to a grabbed marker at drag start, so a
+    /// touch drag doesn't snap the marker to the finger center (see `drag_pos`).
+    pub(crate) grab_offset: egui::Vec2,
+    /// Long-press (right-click substitute) detector for the map canvas.
+    pub(crate) long_press: crate::ui::touch::LongPress,
+    /// Set when a long-press has consumed the current press, so the tap egui emits
+    /// on release doesn't also place/select something.
+    pub(crate) swallow_tap: bool,
+    /// Recomputed each frame from the window width; drives the mobile layout.
+    pub(crate) screen: ScreenClass,
+    /// Latched `true` the first time a touch is seen, so touch laptops / phones get
+    /// finger-sized hit targets and controls even in a wide window.
+    pub(crate) touch: bool,
+    /// The open mobile bottom sheet (narrow layout only).
+    pub(crate) sheet: MobileSheet,
     pub(crate) show_pace: bool,
     pub(crate) show_hr: bool,
     pub(crate) show_ele: bool,
@@ -199,13 +240,22 @@ pub struct App {
     // Files
     pub(crate) image_name: String,
     pub(crate) project_path: Option<PathBuf>,
+    /// Async file-picker results land here (native pickers block briefly, web
+    /// pickers resolve a future); drained at the top of each frame.
+    file_tx: FileSender,
+    file_rx: Receiver<PickedFile>,
 
     // UI
     pub(crate) status: String,
+    /// Last status text shown as a mobile toast, and the `ctx` time it appeared,
+    /// so the toast can fade out a few seconds after the status changes.
+    pub(crate) toast_text: String,
+    pub(crate) toast_time: f64,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let (file_tx, file_rx) = std::sync::mpsc::channel();
         Self {
             map: None,
             athletes: Vec::new(),
@@ -225,6 +275,13 @@ impl App {
             view: ViewState::default(),
             mode: EditMode::Calibrate,
             drag: None,
+            gesturing: false,
+            grab_offset: egui::Vec2::ZERO,
+            long_press: crate::ui::touch::LongPress::default(),
+            swallow_tap: false,
+            screen: ScreenClass::Wide,
+            touch: false,
+            sheet: MobileSheet::None,
             show_pace: true,
             show_hr: true,
             show_ele: true,
@@ -244,7 +301,38 @@ impl App {
             pending_hover: None,
             image_name: String::new(),
             project_path: None,
+            file_tx,
+            file_rx,
             status: "Open a map image and add a GPS track to begin.".into(),
+            toast_text: String::new(),
+            toast_time: 0.0,
+        }
+    }
+
+    // --- File requests (open/save through the platform layer) ----------------
+
+    /// Start an async file picker for `req`; the result is delivered to
+    /// `deliver_file` at the top of a later frame.
+    pub(crate) fn request_file(&self, ctx: &egui::Context, req: FileRequest) {
+        platform::pick_file(req, self.file_tx.clone(), ctx.clone());
+    }
+
+    /// Apply a picked file according to what was requested.
+    fn deliver_file(&mut self, ctx: &egui::Context, f: PickedFile) {
+        match f.request {
+            FileRequest::OpenMap => {
+                // A world-file sidecar or embedded GeoTIFF tags let tracks and IOF
+                // courses land on the map with no calibration. Sidecars need a real
+                // path (native only); the web path relies on embedded GeoTIFF tags.
+                let georef = match &f.path {
+                    Some(p) => crate::io::detect_georef(p, &f.bytes),
+                    None => crate::io::parse_geotiff(&f.bytes),
+                };
+                self.load_image_from_bytes(ctx, f.bytes, f.name, georef);
+            }
+            FileRequest::AddTrack => self.add_athlete(f.bytes, f.name),
+            FileRequest::ImportCourse => self.import_course(&f.bytes),
+            FileRequest::OpenProject => self.open_project_bytes(ctx, f.bytes, f.path),
         }
     }
 
@@ -1077,10 +1165,10 @@ impl App {
         }
     }
 
-    pub(crate) fn save_project(&mut self, path: PathBuf) {
+    /// Serialize the current project to `.legit` bytes, or an error message.
+    fn project_bytes(&self) -> Result<Vec<u8>, String> {
         let Some(map) = &self.map else {
-            self.status = "Nothing to save yet.".into();
-            return;
+            return Err("Nothing to save yet.".into());
         };
         let bundle = ProjectBundle {
             project: self.to_project_file(),
@@ -1088,25 +1176,40 @@ impl App {
             tracks: self.athletes.iter().map(|a| a.track_bytes.clone()).collect(),
             legacy_control_indices: None,
         };
-        match io::write_bundle(&bundle)
-            .and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string()))
-        {
-            Ok(()) => {
-                self.project_path = Some(path);
-                self.status = "Project saved.".into();
+        io::write_bundle(&bundle)
+    }
+
+    /// Save the project: serialize, then hand the bytes to the platform save
+    /// (native dialog + write, or web download).
+    pub(crate) fn save_project(&mut self) {
+        let bytes = match self.project_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = e;
+                return;
             }
+        };
+        let name = self
+            .project_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "analysis.legit".into());
+        match platform::save_file(SaveKind::Project, &name, bytes) {
+            Ok(true) => self.status = "Project saved.".into(),
+            Ok(false) => {} // cancelled
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
-    pub(crate) fn open_project(&mut self, ctx: &egui::Context, path: PathBuf) {
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.status = format!("Open failed: {e}");
-                return;
-            }
-        };
+    /// Load a project from `.legit` bytes. `path` (native only) lets us remember a
+    /// suggested name for the next save.
+    pub(crate) fn open_project_bytes(
+        &mut self,
+        ctx: &egui::Context,
+        bytes: Vec<u8>,
+        path: Option<PathBuf>,
+    ) {
         let bundle = match io::read_bundle(&bytes) {
             Ok(b) => b,
             Err(e) => {
@@ -1171,28 +1274,54 @@ impl App {
         self.selected_leg = None;
         // A saved project is already set up — land straight in Analysis.
         self.tab = ViewTab::Analysis;
-        self.project_path = Some(path);
+        self.project_path = path;
         self.status = "Project opened.".into();
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Deliver any files the pickers resolved since last frame (collect first so
+        // the receiver borrow ends before `deliver_file` takes `&mut self`).
+        let ctx = ui.ctx().clone();
+        for f in self.file_rx.try_iter().collect::<Vec<_>>() {
+            self.deliver_file(&ctx, f);
+        }
+        // Screen class + touch: a narrow window (phone) gets the map-first mobile
+        // layout; the touch flag latches on the first touch and never clears.
+        // The root Ui spans the whole window before any panels take their space.
+        self.screen = if ui.max_rect().width() < 600.0 {
+            ScreenClass::Narrow
+        } else {
+            ScreenClass::Wide
+        };
+        if ctx.input(|i| i.any_touches()) {
+            self.touch = true;
+        }
+        if self.touch {
+            Self::apply_touch_style(&ctx);
+        }
+
         // Panels draw the cross-highlight cursor from last frame's `hover_km` and
         // report this frame's hover into `pending_hover`; commit it at the end.
         self.pending_hover = None;
-        self.top_bar(ui);
-        self.side_panel(ui);
-        match self.tab {
-            ViewTab::Setup => self.map_panel(ui),
-            ViewTab::Analysis => {
-                // Bottom stack, outermost first: transport bar, then the Splits and
-                // Graphs drawers above it, with the map filling the rest.
-                self.playback_bar(ui);
-                self.splits_drawer(ui);
-                self.bottom_graphs(ui);
-                self.map_panel(ui);
+        match self.screen {
+            ScreenClass::Wide => {
+                self.top_bar(ui);
+                self.side_panel(ui);
+                match self.tab {
+                    ViewTab::Setup => self.map_panel(ui),
+                    ViewTab::Analysis => {
+                        // Bottom stack, outermost first: transport bar, then the
+                        // Splits and Graphs drawers above it, map filling the rest.
+                        self.playback_bar(ui);
+                        self.splits_drawer(ui);
+                        self.bottom_graphs(ui);
+                        self.map_panel(ui);
+                    }
+                }
             }
+            ScreenClass::Narrow => self.mobile_ui(ui),
         }
         self.hover_km = self.pending_hover;
         self.hover_index = self.hover_km.and_then(|km| self.track_index_at_km(km));

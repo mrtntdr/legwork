@@ -16,7 +16,28 @@ quick-xml = "0.41.0"
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-zip = "8.6.0"
+# Deflate-only: the default features pull zstd/bzip2 (C code) which don't build
+# for wasm32. The project writer only ever emits Deflated entries, so this is
+# lossless for reading and writing `.legit` bundles.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Web (wasm) build: browser glue for the entry point and file up/download.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "console",
+    "Document",
+    "Element",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "Url",
+    "Window",
+] }
