@@ -6,7 +6,9 @@ use crate::athlete::{ATHLETE_COLORS, Athlete};
 use crate::geo::{Correspondence, LocalProjection, MapTransform, invert_transform};
 use crate::io;
 use crate::io::{Crs, MapGeoref, ProjectBundle};
-use crate::model::{AthleteFile, CoursePoint, DrawnRoute, ProjectFileV2, ViewState, Waypoint, haversine};
+use crate::model::{
+    AthleteFile, CoursePoint, DrawnRoute, ProjectFileV2, RefPoint, ViewState, Waypoint, haversine,
+};
 use chrono::{DateTime, Utc};
 use egui::{Color32, Pos2, TextureHandle, pos2};
 use std::path::PathBuf;
@@ -32,6 +34,9 @@ pub enum ViewTab {
 pub enum EditMode {
     Calibrate,
     Control,
+    /// Place the map in the world by typing the real coordinates of points on it
+    /// (usually its corners).
+    Reference,
 }
 
 /// What the active pointer drag is manipulating.
@@ -40,6 +45,8 @@ pub enum DragTarget {
     View,
     Calibration(usize),
     Control(usize),
+    /// Correcting the map position of a geographic reference point.
+    Reference(usize),
     /// Moving one vertex of a finished drawn route.
     RouteVertex { route: usize, vertex: usize },
     /// A freehand pen stroke feeding the current route draft.
@@ -127,8 +134,23 @@ pub struct App {
     /// every athlete's transform maps the same meter frame to image pixels (which
     /// lets an uncalibrated athlete borrow a calibrated athlete's transform).
     pub(crate) proj: Option<LocalProjection>,
-    /// Map georeferencing from a world file or GeoTIFF, when the map has one.
+    /// The map's effective georeferencing: the manual reference points when there
+    /// are enough of them, otherwise `base_georef`. Derived — rebuild it with
+    /// `rebuild_georef` rather than assigning to it.
     pub(crate) georef: Option<MapGeoref>,
+    /// Georeferencing that came with the map itself (world file / GeoTIFF, or a
+    /// project saved with one). Kept apart from `georef` so clearing the manual
+    /// reference points falls back to it instead of losing it.
+    base_georef: Option<MapGeoref>,
+    /// Hand-entered reference points — map corners and other spots whose real
+    /// coordinates the user knows. Two or more georeference the map on their own.
+    /// Persisted.
+    pub(crate) ref_points: Vec<RefPoint>,
+    /// An image-pixel position waiting for its coordinates to be typed in, set by
+    /// clicking the map or picking a corner in Reference mode. Transient.
+    pub(crate) ref_draft: Option<[f64; 2]>,
+    /// Text buffer for the coordinates of `ref_draft`. Transient.
+    pub(crate) ref_input: String,
     /// The georef expressed as a shared meters→pixels transform (an affine fit of
     /// the projection chain over the loaded tracks' extent). Used as the base for
     /// every athlete without their own calibration.
@@ -212,6 +234,10 @@ impl App {
             active: 0,
             proj: None,
             georef: None,
+            base_georef: None,
+            ref_points: Vec::new(),
+            ref_draft: None,
+            ref_input: String::new(),
             georef_mt: None,
             controls: Vec::new(),
             drawn_routes: Vec::new(),
@@ -311,9 +337,11 @@ impl App {
                     Some(g) => format!("Loaded map ({w}x{h}) — georeferenced ({}).", g.describe()),
                     None => format!("Loaded map ({w}x{h})."),
                 };
-                self.georef = georef;
-                self.refresh_georef_transform();
-                self.recompute_all_transforms();
+                // Reference points are pixel positions on the *previous* image.
+                self.ref_points.clear();
+                self.ref_draft = None;
+                self.base_georef = georef;
+                self.rebuild_georef();
             }
             Err(e) => self.status = e,
         }
@@ -463,6 +491,66 @@ impl App {
                     .and_then(|(_, a)| a.transform.clone())
             })
             .or_else(|| self.initial_transform(&self.athletes.get(i)?.projected))
+    }
+
+    // --- Georeferencing from hand-entered reference points ---------------------
+
+    /// Rebuild the effective georeferencing and let it flow down to every derived
+    /// transform. Two or more reference points win over whatever the map file
+    /// itself carried, because the user typed them for this map on purpose.
+    pub(crate) fn rebuild_georef(&mut self) {
+        self.georef = io::georef_from_points(&self.ref_points).or_else(|| self.base_georef.clone());
+        self.refresh_georef_transform();
+        self.recompute_all_transforms();
+        // With no athletes loaded nothing above touched the measuring chain, and a
+        // corner-placed map is exactly the case where routes get measured without
+        // a single GPS track.
+        self.refresh_px_to_m();
+    }
+
+    /// Add a reference point at an image position and refit the map to the world.
+    pub(crate) fn add_ref_point(&mut self, image_px: [f64; 2], lat: f64, lon: f64) {
+        self.ref_points.push(RefPoint { image_px, lat, lon });
+        self.ref_draft = None;
+        self.ref_input.clear();
+        self.rebuild_georef();
+        self.status = self.georef_status();
+    }
+
+    pub(crate) fn remove_ref_point(&mut self, i: usize) {
+        if i < self.ref_points.len() {
+            self.ref_points.remove(i);
+            self.rebuild_georef();
+            self.status = self.georef_status();
+        }
+    }
+
+    pub(crate) fn clear_ref_points(&mut self) {
+        self.ref_points.clear();
+        self.ref_draft = None;
+        self.ref_input.clear();
+        self.rebuild_georef();
+        self.status = self.georef_status();
+    }
+
+    /// One line on where the map's georeferencing currently stands — how many
+    /// reference points are in, and how well the fit honors them.
+    pub(crate) fn georef_status(&self) -> String {
+        let n = self.ref_points.len();
+        match (n, &self.georef) {
+            (0, Some(g)) => format!("Map georeferenced by the map file itself ({}).", g.describe()),
+            (0, None) => "Not georeferenced — add two map corners with known coordinates.".into(),
+            (1, _) => {
+                "1 reference point — add one more (the opposite corner) to place the map.".into()
+            }
+            (_, Some(g)) => match g.residual_m(&self.ref_points) {
+                Some(m) if n > 2 => {
+                    format!("Map placed from {n} reference points (fit {m:.0} m).")
+                }
+                _ => format!("Map placed from {n} reference points."),
+            },
+            (_, None) => "Those reference points don't define a mapping — spread them out.".into(),
+        }
     }
 
     /// Rebuild `georef_mt`: resolve the georef's CRS if needed (using the first
@@ -1008,8 +1096,8 @@ impl App {
             .map(|(x, y)| CoursePoint::at(x, y))
             .collect();
         if pts.is_empty() {
-            self.status = "Can't place the course yet: open a georeferenced map, or calibrate \
-                           a track first."
+            self.status = "Can't place the course yet: georeference the map (a world file, \
+                           or two corner coordinates), or calibrate a track first."
                 .into();
             return;
         }
@@ -1072,8 +1160,11 @@ impl App {
             controls: self.controls.clone(),
             active: self.active,
             view: self.view,
-            georef: self.georef.as_ref().map(|g| g.to_file()),
+            // The map's *own* georeferencing; the reference points are saved beside
+            // it so removing them after a reload still falls back correctly.
+            georef: self.base_georef.as_ref().map(|g| g.to_file()),
             routes: self.drawn_routes.clone(),
+            ref_points: self.ref_points.clone(),
         }
     }
 
@@ -1120,7 +1211,15 @@ impl App {
         self.proj = None;
         self.controls.clear();
         let georef = project.georef.as_ref().map(MapGeoref::from_file);
+        let ref_points = project.ref_points.clone();
         self.load_image_from_bytes(ctx, bundle.image_bytes, project.image_name.clone(), georef);
+        // Loading the image cleared these (they belong to an image's pixel grid);
+        // put this project's back before the tracks arrive, so a map placed by its
+        // corners already positions the first track.
+        self.ref_points = ref_points;
+        self.ref_draft = None;
+        self.ref_input.clear();
+        self.rebuild_georef();
         for (meta, track_bytes) in project.athletes.into_iter().zip(bundle.tracks) {
             let file_name = meta
                 .track_entry
@@ -1147,7 +1246,7 @@ impl App {
         self.selected_route = None;
         self.draft = None;
         self.draw_mode = false;
-        self.recompute_all_transforms();
+        self.rebuild_georef();
 
         // V1 controls were waypoint indices into the single track; place them on the
         // map exactly where the old renderer drew them (through the track's transform).

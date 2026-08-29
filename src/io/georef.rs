@@ -2,8 +2,8 @@
 //! and embedded GeoTIFF tags. When present, they define an exact mapping from
 //! WGS84 lat/lon to image pixels, so GPS tracks align with no manual calibration.
 
-use crate::geo::{TmParams, tm_forward};
-use crate::model::{CrsFile, GeorefFile};
+use crate::geo::{Correspondence, MapTransform, TmParams, tm_forward};
+use crate::model::{CrsFile, GeorefFile, RefPoint};
 use std::path::{Path, PathBuf};
 
 /// The coordinate reference system of a map's world coordinates.
@@ -119,6 +119,28 @@ impl MapGeoref {
         }
     }
 
+    /// RMS distance, in ground meters, between where each reference point claims
+    /// to be and where this georeferencing actually puts it — how well the fit
+    /// honors the coordinates the user typed. Only meaningful on a grid CRS
+    /// (which is what `georef_from_points` produces); `None` otherwise.
+    pub fn residual_m(&self, pts: &[RefPoint]) -> Option<f64> {
+        let Crs::TransverseMercator(tm) = self.crs else {
+            return None;
+        };
+        if pts.is_empty() {
+            return None;
+        }
+        let sum: f64 = pts
+            .iter()
+            .map(|p| {
+                let (e, n) = tm_forward(tm, p.lat, p.lon);
+                let (ae, an) = self.px_to_world(p.image_px[0], p.image_px[1]);
+                (ae - e).powi(2) + (an - n).powi(2)
+            })
+            .sum();
+        Some((sum / pts.len() as f64).sqrt())
+    }
+
     pub fn to_file(&self) -> GeorefFile {
         GeorefFile {
             px_to_world: self.px_to_world,
@@ -158,6 +180,107 @@ impl MapGeoref {
             },
         }
     }
+}
+
+// --- Manual reference points ---------------------------------------------------
+
+/// Georeference a map from hand-entered reference points: spots on the image
+/// whose real-world coordinates the user knows — normally the map's corners, read
+/// off the printed sheet's margin. This is the path for a plain photo or scan
+/// with no world file and no GPS track to calibrate against.
+///
+/// The coordinates are projected into the UTM grid under their centroid, so the
+/// world side comes out in meters and every downstream consumer (route measuring,
+/// control placement, track overlay) follows the same well-supported
+/// transverse-Mercator path a world file would. Two points fit a similarity —
+/// rotation, uniform scale, translation, the honest model for a map sheet — and
+/// three or more spread across the sheet a full affine, which also absorbs the
+/// slight non-uniform stretch of a scan.
+///
+/// `None` below two points, or when they sit on top of each other and so say
+/// nothing about scale or rotation.
+pub fn georef_from_points(pts: &[RefPoint]) -> Option<MapGeoref> {
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let lat = pts.iter().map(|p| p.lat).sum::<f64>() / n;
+    let lon = pts.iter().map(|p| p.lon).sum::<f64>() / n;
+    let tm = TmParams::utm_for(lat, lon);
+
+    // Fit pixels → (easting, *southing*). Negating the northing puts source and
+    // destination in the same handedness (x right, y down), which is what the
+    // orientation-preserving similarity fit expects — a map scan is never mirrored.
+    let corr: Vec<Correspondence> = pts
+        .iter()
+        .map(|p| {
+            let (e, north) = tm_forward(tm, p.lat, p.lon);
+            ((p.image_px[0], p.image_px[1]), (e, -north))
+        })
+        .collect();
+    let (span, off_line) = pixel_spread(pts);
+    if span < 1e-9 {
+        return None; // coincident points: no scale, no rotation, nothing to fit
+    }
+    // A full affine needs real two-dimensional spread. Points strung out along one
+    // line (say, three ticks down the sheet's west edge) leave the across-line
+    // scale free, so fit the similarity they *do* determine instead of a warp.
+    let fit = if pts.len() >= 3 && off_line > span * 0.02 {
+        MapTransform::fit_affine(&corr)
+    } else {
+        MapTransform::fit_similarity(&corr)
+    };
+    let MapTransform::Matrix(m) = fit? else {
+        return None;
+    };
+    // Undo the northing flip on the second row.
+    let px_to_world = [
+        m[(0, 0)],
+        m[(0, 1)],
+        m[(0, 2)],
+        -m[(1, 0)],
+        -m[(1, 1)],
+        -m[(1, 2)],
+    ];
+    let det = px_to_world[0] * px_to_world[4] - px_to_world[1] * px_to_world[3];
+    if !px_to_world.iter().all(|v| v.is_finite()) || det.abs() < 1e-12 {
+        return None; // no usable inverse
+    }
+    Some(MapGeoref {
+        px_to_world,
+        crs: Crs::TransverseMercator(tm),
+    })
+}
+
+/// Pixel-space geometry of a reference set: the distance between its two farthest
+/// points, and how far the rest stray from the line joining them. The first says
+/// whether there's any scale to read at all, the second whether the set pins down
+/// a full affine or only a similarity.
+fn pixel_spread(pts: &[RefPoint]) -> (f64, f64) {
+    let mut span = 0.0;
+    let (mut a, mut b) = ([0.0; 2], [0.0; 2]);
+    for (i, p) in pts.iter().enumerate() {
+        for q in &pts[i + 1..] {
+            let d = ((q.image_px[0] - p.image_px[0]).powi(2)
+                + (q.image_px[1] - p.image_px[1]).powi(2))
+            .sqrt();
+            if d > span {
+                span = d;
+                (a, b) = (p.image_px, q.image_px);
+            }
+        }
+    }
+    if span <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let off = pts
+        .iter()
+        .map(|p| {
+            let (px, py) = (p.image_px[0], p.image_px[1]);
+            ((b[0] - a[0]) * (a[1] - py) - (a[0] - px) * (b[1] - a[1])).abs() / span
+        })
+        .fold(0.0, f64::max);
+    (span, off)
 }
 
 // --- World files ---------------------------------------------------------------
@@ -674,6 +797,142 @@ mod tests {
         assert_eq!(g.crs, Crs::UnknownProjected);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reference point at an image pixel with a WGS84 position.
+    fn rp(col: f64, row: f64, lat: f64, lon: f64) -> RefPoint {
+        RefPoint {
+            image_px: [col, row],
+            lat,
+            lon,
+        }
+    }
+
+    #[test]
+    fn two_opposite_corners_georeference_the_map() {
+        // A 2000x1500 sheet whose NW and SE corners are known. The fit must put
+        // each corner back on its own pixel and the CRS must be a usable grid.
+        let (nw_lat, nw_lon) = (59.3400, 18.0500);
+        let (se_lat, se_lon) = (59.3300, 18.0700);
+        let pts = [
+            rp(0.0, 0.0, nw_lat, nw_lon),
+            rp(2000.0, 1500.0, se_lat, se_lon),
+        ];
+        let g = georef_from_points(&pts).expect("two points are enough");
+        assert!(matches!(g.crs, Crs::TransverseMercator(_)));
+        for p in &pts {
+            let (col, row) = g.latlon_to_px(p.lat, p.lon).unwrap();
+            assert!((col - p.image_px[0]).abs() < 1e-3, "col {col}");
+            assert!((row - p.image_px[1]).abs() < 1e-3, "row {row}");
+        }
+        assert!(g.residual_m(&pts).unwrap() < 1e-3);
+
+        // North is up and east is right: the map's own corners bracket the middle.
+        let (col, row) = g
+            .latlon_to_px((nw_lat + se_lat) / 2.0, (nw_lon + se_lon) / 2.0)
+            .unwrap();
+        assert!((col - 1000.0).abs() < 30.0, "center col {col}");
+        assert!((row - 750.0).abs() < 30.0, "center row {row}");
+    }
+
+    #[test]
+    fn four_corners_fit_and_measure_ground_distance() {
+        // A north-up sheet: 0.01° of latitude tall (~1111 m) over 1000 rows.
+        let pts = [
+            rp(0.0, 0.0, 59.34, 18.05),
+            rp(1000.0, 0.0, 59.34, 18.07),
+            rp(1000.0, 1000.0, 59.33, 18.07),
+            rp(0.0, 1000.0, 59.33, 18.05),
+        ];
+        let g = georef_from_points(&pts).expect("four points fit");
+        // Each corner is honored to well under a meter (the affine is exact here
+        // apart from the map projection's own curvature over the sheet).
+        assert!(g.residual_m(&pts).unwrap() < 1.0);
+        // Top edge to bottom edge is 0.01° of latitude ≈ 1111 m.
+        let a = g.px_to_world(500.0, 0.0);
+        let b = g.px_to_world(500.0, 1000.0);
+        let dist = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        assert!((dist - 1111.0).abs() < 15.0, "{dist} m");
+    }
+
+    #[test]
+    fn a_rotated_sheet_is_fitted_without_mirroring() {
+        // Build a truth mapping that is a 20° rotation + scale of a north-up sheet,
+        // sample three of its corners, and check the fit reproduces the fourth.
+        let truth = MapGeoref {
+            px_to_world: [
+                2.0 * 0.9397,
+                2.0 * 0.3420,
+                650_000.0,
+                2.0 * 0.3420,
+                -2.0 * 0.9397,
+                6_580_000.0,
+            ],
+            crs: Crs::TransverseMercator(TmParams::utm_for(59.3, 18.0)),
+        };
+        let corners = [(0.0, 0.0), (1200.0, 0.0), (1200.0, 900.0)];
+        let pts: Vec<RefPoint> = corners
+            .iter()
+            .map(|&(col, row)| {
+                let (e, n) = truth.px_to_world(col, row);
+                let (lat, lon) = utm_inverse(&truth, e, n);
+                rp(col, row, lat, lon)
+            })
+            .collect();
+        let g = georef_from_points(&pts).expect("three points fit an affine");
+        let (e, n) = truth.px_to_world(0.0, 900.0);
+        let (lat, lon) = utm_inverse(&truth, e, n);
+        let (col, row) = g.latlon_to_px(lat, lon).unwrap();
+        assert!((col - 0.0).abs() < 1.0, "col {col}");
+        assert!((row - 900.0).abs() < 1.0, "row {row}");
+    }
+
+    /// Invert a TM grid position back to lat/lon by Newton iteration on
+    /// `tm_forward`, so the tests can build reference points from grid truth.
+    fn utm_inverse(g: &MapGeoref, e: f64, n: f64) -> (f64, f64) {
+        let Crs::TransverseMercator(tm) = g.crs else {
+            panic!("grid CRS expected")
+        };
+        let (mut lat, mut lon) = (59.3, 18.0);
+        for _ in 0..40 {
+            let (ce, cn) = tm_forward(tm, lat, lon);
+            // ~1 m per 9e-6° of latitude; longitude scales by cos(lat).
+            lat += (n - cn) * 9e-6;
+            lon += (e - ce) * 9e-6 / lat.to_radians().cos();
+        }
+        (lat, lon)
+    }
+
+    #[test]
+    fn too_few_or_degenerate_points_give_no_georeferencing() {
+        assert!(georef_from_points(&[]).is_none());
+        assert!(georef_from_points(&[rp(0.0, 0.0, 59.34, 18.05)]).is_none());
+        // Two points on the same pixel say nothing about scale or rotation.
+        assert!(
+            georef_from_points(&[rp(10.0, 10.0, 59.34, 18.05), rp(10.0, 10.0, 59.33, 18.07)])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn collinear_points_fall_back_to_a_similarity() {
+        // Three ticks along the sheet's north edge leave the north–south scale
+        // free, so an affine would be under-determined — the similarity they do
+        // determine is used instead, and it still honors every point.
+        let pts = [
+            rp(0.0, 0.0, 59.34, 18.05),
+            rp(500.0, 0.0, 59.34, 18.06),
+            rp(1000.0, 0.0, 59.34, 18.07),
+        ];
+        let g = georef_from_points(&pts).expect("a similarity still fits");
+        assert!(g.residual_m(&pts).unwrap() < 1.0);
+        // Uniform scale: half the width across is half the ground distance.
+        let a = g.px_to_world(0.0, 0.0);
+        let b = g.px_to_world(1000.0, 0.0);
+        let c = g.px_to_world(0.0, 1000.0);
+        let across = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        let down = ((c.0 - a.0).powi(2) + (c.1 - a.1).powi(2)).sqrt();
+        assert!((across - down).abs() < 1e-6, "{across} vs {down}");
     }
 
     #[test]

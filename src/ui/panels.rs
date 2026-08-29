@@ -1,7 +1,13 @@
 use crate::analysis::{compare, fmt_duration, fmt_pace, leg_label, quickness_color};
 use crate::app::{App, EditMode, FitRequest, ViewTab};
 use crate::athlete::route_color;
+use crate::geo::{format_latlon, parse_latlon};
 use egui::{Color32, RichText};
+
+/// A reference point sits "at a corner" when it's within this fraction of the
+/// image's width and height of one — close enough that naming it NW/NE/SE/SW is
+/// more useful than printing its pixel position.
+const CORNER_MARGIN: f64 = 0.15;
 
 /// Highlight color for the best (fastest) athlete in the leg summary.
 const BEST_GREEN: Color32 = Color32::from_rgb(80, 210, 120);
@@ -46,6 +52,7 @@ impl App {
                     ui.separator();
                     ui.selectable_value(&mut self.mode, EditMode::Calibrate, "Calibrate");
                     ui.selectable_value(&mut self.mode, EditMode::Control, "Course");
+                    ui.selectable_value(&mut self.mode, EditMode::Reference, "Georeference");
                 }
             });
         });
@@ -158,6 +165,7 @@ impl App {
         match self.mode {
             EditMode::Calibrate => self.calibration_section(ui),
             EditMode::Control => self.course_section(ui),
+            EditMode::Reference => self.reference_section(ui),
         }
     }
 
@@ -655,6 +663,121 @@ impl App {
         );
     }
 
+    /// Georeference: place the map in the world by typing the real coordinates of
+    /// points on it — normally two opposite corners, read off the printed sheet's
+    /// margin. That alone georeferences a plain photo or scan: tracks land in the
+    /// right place with no calibration, imported courses can be placed, and drawn
+    /// routes measure in meters even with no GPS track loaded at all.
+    fn reference_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Georeference");
+        let Some(size) = self.map.as_ref().map(|m| m.size) else {
+            ui.label("Open a map image first.");
+            return;
+        };
+        ui.label(
+            RichText::new(
+                "Give two or more points on the map their real coordinates — \
+                 opposite corners are usually printed on the sheet. Pick a corner \
+                 below, or click anywhere on the map.",
+            )
+            .weak()
+            .small(),
+        );
+
+        // The four sheet corners, laid out the way they sit on the map.
+        let (w, h) = (size[0] as f64, size[1] as f64);
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label("Corner:");
+            for (label, px) in [
+                ("↖ NW", [0.0, 0.0]),
+                ("↗ NE", [w, 0.0]),
+                ("↘ SE", [w, h]),
+                ("↙ SW", [0.0, h]),
+            ] {
+                let taken = self.ref_points.iter().any(|r| r.image_px == px);
+                if ui
+                    .add_enabled(!taken, egui::Button::new(label))
+                    .on_hover_text("Aim the next reference point at this image corner")
+                    .clicked()
+                {
+                    self.ref_draft = Some(px);
+                }
+            }
+        });
+
+        // The point being entered: where it is, and a single field for its coordinates.
+        if let Some(px) = self.ref_draft {
+            ui.add_space(4.0);
+            ui.group(|ui| {
+                ui.label(format!("New point at {}", describe_px(px, size)));
+                let parsed = parse_latlon(&self.ref_input);
+                let mut submit = false;
+                ui.horizontal(|ui| {
+                    let field = egui::TextEdit::singleline(&mut self.ref_input)
+                        .hint_text("59.3321, 18.0654")
+                        .desired_width(170.0);
+                    if ui.add(field).lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        submit = true;
+                    }
+                    submit |= ui
+                        .add_enabled(parsed.is_some(), egui::Button::new("Add"))
+                        .clicked();
+                    if ui.button("Cancel").clicked() {
+                        self.ref_draft = None;
+                        self.ref_input.clear();
+                    }
+                });
+                match parsed {
+                    Some((lat, lon)) if submit => self.add_ref_point(px, lat, lon),
+                    None if !self.ref_input.trim().is_empty() => {
+                        ui.label(
+                            RichText::new(
+                                "Not a coordinate pair. Decimal degrees, or 59°19'55\"N 18°03'55\"E.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    _ => {}
+                }
+            });
+        }
+
+        // The points that are in, each removable.
+        ui.add_space(4.0);
+        let mut remove: Option<usize> = None;
+        for (i, r) in self.ref_points.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("G{}", i + 1));
+                ui.label(RichText::new(describe_px(r.image_px, size)).weak().small());
+                ui.label(format_latlon(r.lat, r.lon));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✕").on_hover_text("Remove this point").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            });
+        }
+        if let Some(i) = remove {
+            self.remove_ref_point(i);
+        }
+
+        ui.add_space(2.0);
+        ui.label(self.georef_status());
+        if !self.ref_points.is_empty() && ui.button("Clear reference points").clicked() {
+            self.clear_ref_points();
+        }
+        ui.label(
+            RichText::new("Drag a marker to correct its map position; right-click removes it.")
+                .weak()
+                .small(),
+        );
+    }
+
     /// Route coloring controls: an interactive pace/color palette whose two handles
     /// (red = quick, blue = slow) set the cutoffs, plus an auto toggle.
     fn coloring_controls(&mut self, ui: &mut egui::Ui) {
@@ -831,6 +954,29 @@ fn route_display_name(r: &crate::model::DrawnRoute, n: usize, n_controls: usize)
     }
 }
 
+/// Name an image position for the reference-point list: the corner it sits at,
+/// or its pixel coordinates when it's somewhere in the middle of the map.
+fn describe_px(px: [f64; 2], size: [usize; 2]) -> String {
+    let (w, h) = (size[0] as f64, size[1] as f64);
+    let near = |v: f64, span: f64| {
+        if v <= span * CORNER_MARGIN {
+            Some(false)
+        } else if v >= span * (1.0 - CORNER_MARGIN) {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    match (near(px[1], h), near(px[0], w)) {
+        (Some(south), Some(east)) => format!(
+            "{}{} corner",
+            if south { "S" } else { "N" },
+            if east { "E" } else { "W" }
+        ),
+        _ => format!("{:.0}, {:.0} px", px[0], px[1]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,5 +1012,18 @@ mod tests {
     fn file_name_falls_back_when_pathless() {
         assert_eq!(file_name(std::path::Path::new("/a/b/run.gpx")), "run.gpx");
         assert_eq!(file_name(std::path::Path::new("/")), "file");
+    }
+
+    #[test]
+    fn corners_are_named_and_the_middle_is_not() {
+        let size = [1000, 800];
+        assert_eq!(describe_px([0.0, 0.0], size), "NW corner");
+        assert_eq!(describe_px([1000.0, 0.0], size), "NE corner");
+        assert_eq!(describe_px([1000.0, 800.0], size), "SE corner");
+        assert_eq!(describe_px([0.0, 800.0], size), "SW corner");
+        // Slightly inside the sheet edge still reads as that corner.
+        assert_eq!(describe_px([40.0, 30.0], size), "NW corner");
+        assert_eq!(describe_px([500.0, 400.0], size), "500, 400 px");
+        assert_eq!(describe_px([20.0, 400.0], size), "20, 400 px");
     }
 }

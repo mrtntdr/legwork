@@ -78,6 +78,7 @@ pub fn read_bundle(bytes: &[u8]) -> Result<ProjectBundle, String> {
                     view: p.view,
                     georef: None,
                     routes: Vec::new(),
+                    ref_points: Vec::new(),
                 },
                 Some(controls),
             )
@@ -162,6 +163,11 @@ mod tests {
                     name: String::new(),
                     color: None,
                 }],
+                ref_points: vec![crate::model::RefPoint {
+                    image_px: [0.0, 0.0],
+                    lat: 59.4,
+                    lon: 18.1,
+                }],
             },
             image_bytes: vec![1, 2, 3, 4],
             tracks: vec![b"<gpx a/>".to_vec(), b"<gpx b/>".to_vec()],
@@ -188,6 +194,8 @@ mod tests {
         assert_eq!(back.image_bytes, vec![1, 2, 3, 4]);
         assert_eq!(back.tracks, vec![b"<gpx a/>".to_vec(), b"<gpx b/>".to_vec()]);
         assert!(back.legacy_control_indices.is_none());
+        assert_eq!(back.project.ref_points.len(), 1);
+        assert_eq!(back.project.ref_points[0].lat, 59.4);
         let georef = back.project.georef.expect("georef survives the round trip");
         assert_eq!(georef.px_to_world[2], 650000.0);
         assert!(matches!(

@@ -1,7 +1,7 @@
 use crate::analysis::{color_for, route_midpoint_px};
 use crate::app::{App, DragTarget, EditMode, FitRequest, RouteDraft, ViewTab};
 use crate::athlete::{Athlete, route_color};
-use crate::geo::{point_segment_dist, simplify_polyline};
+use crate::geo::{format_latlon, point_segment_dist, simplify_polyline};
 use crate::model::{CalibrationPoint, CoursePoint, DrawnRoute};
 use egui::{Align2, Color32, FontId, Rect, Sense, Shape, Stroke, pos2, vec2};
 
@@ -33,11 +33,21 @@ impl App {
                     }
                 }
             } else {
-                // Ctrl/Cmd+Z removes the active athlete's latest calibration point.
+                // Ctrl/Cmd+Z steps back one point of whatever is being placed.
                 let undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
-                if undo && self.active_mut().is_some_and(|a| a.calibration.pop().is_some()) {
-                    self.recompute_transform_active();
-                    self.status = "Undid last calibration point.".into();
+                let mode = self.mode;
+                if undo {
+                    match mode {
+                        EditMode::Reference if !self.ref_points.is_empty() => {
+                            self.remove_ref_point(self.ref_points.len() - 1);
+                        }
+                        EditMode::Reference => {}
+                        _ if self.active_mut().is_some_and(|a| a.calibration.pop().is_some()) => {
+                            self.recompute_transform_active();
+                            self.status = "Undid last calibration point.".into();
+                        }
+                        _ => {}
+                    }
                 }
             }
             self.apply_pending_rotation(rect);
@@ -347,6 +357,7 @@ impl App {
             ViewTab::Setup => match self.mode {
                 EditMode::Calibrate => self.handle_calibrate(resp, origin),
                 EditMode::Control => self.handle_control_mode(resp, origin),
+                EditMode::Reference => self.handle_reference(resp, origin),
             },
             // Analysis: read-only for the course. Draw mode sketches route options;
             // otherwise pan/zoom and clicking a control jumps to a leg.
@@ -491,6 +502,63 @@ impl App {
         if resp.drag_stopped() {
             self.drag = None;
         }
+    }
+
+    /// Reference mode: click the map to aim the next reference point (its
+    /// coordinates are typed in the side panel), drag an existing one to correct
+    /// its map position, right-click to remove it. Empty-space drags still pan.
+    fn handle_reference(&mut self, resp: &egui::Response, origin: egui::Pos2) {
+        if resp.secondary_clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+            && let Some(i) = self.ref_point_at(origin, p)
+        {
+            self.remove_ref_point(i);
+            return;
+        }
+        if resp.drag_started()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            self.drag = Some(match self.ref_point_at(origin, p) {
+                Some(i) => DragTarget::Reference(i),
+                None => DragTarget::View,
+            });
+        }
+        if resp.dragged() {
+            match self.drag {
+                Some(DragTarget::Reference(i)) => {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        let img = self.to_image(origin, p);
+                        if let Some(r) = self.ref_points.get_mut(i) {
+                            r.image_px = [img.0, img.1];
+                        }
+                        self.rebuild_georef();
+                    }
+                }
+                _ => self.pan(resp),
+            }
+        }
+        if resp.drag_stopped() {
+            self.drag = None;
+            self.status = self.georef_status();
+        }
+        if resp.clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            if self.map.is_none() {
+                self.status = "Open a map before placing reference points.".into();
+                return;
+            }
+            let img = self.to_image(origin, p);
+            self.ref_draft = Some([img.0, img.1]);
+            self.status = "Type this point\u{2019}s coordinates in the panel, then Add.".into();
+        }
+    }
+
+    /// Index of the reference point under a screen point, if any.
+    fn ref_point_at(&self, origin: egui::Pos2, p: egui::Pos2) -> Option<usize> {
+        self.ref_points.iter().position(|r| {
+            (self.to_screen(origin, (r.image_px[0], r.image_px[1])) - p).length() < HIT_RADIUS
+        })
     }
 
     /// Index of the active athlete's calibration pin under a screen point, if any.
@@ -1092,6 +1160,60 @@ impl App {
                 );
             }
         }
+        // Geographic reference points: amber squares (a corner mark, distinct from
+        // the round calibration pins) with the entered coordinates alongside. Only
+        // while placing them, so they never clutter the analysis view.
+        if self.tab == ViewTab::Setup && self.mode == EditMode::Reference {
+            let amber = Color32::from_rgb(255, 180, 40);
+            for (i, r) in self.ref_points.iter().enumerate() {
+                let s = self.to_screen(origin, (r.image_px[0], r.image_px[1]));
+                let box_ = Rect::from_center_size(s, vec2(16.0, 16.0));
+                painter.rect_filled(box_, 1.0, Color32::from_rgba_unmultiplied(120, 80, 0, 90));
+                painter.rect_stroke(
+                    box_,
+                    1.0,
+                    Stroke::new(2.0, amber),
+                    egui::StrokeKind::Middle,
+                );
+                painter.line_segment(
+                    [s - vec2(8.0, 0.0), s + vec2(8.0, 0.0)],
+                    Stroke::new(1.0, amber),
+                );
+                painter.line_segment(
+                    [s - vec2(0.0, 8.0), s + vec2(0.0, 8.0)],
+                    Stroke::new(1.0, amber),
+                );
+                painter.text(
+                    s + vec2(12.0, -12.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("G{} {}", i + 1, format_latlon(r.lat, r.lon)),
+                    FontId::proportional(11.0),
+                    amber,
+                );
+            }
+            // The spot waiting for its coordinates.
+            if let Some(px) = self.ref_draft {
+                let s = self.to_screen(origin, (px[0], px[1]));
+                let white = Color32::WHITE;
+                painter.circle_stroke(s, 11.0, Stroke::new(2.0, white));
+                painter.line_segment(
+                    [s - vec2(15.0, 0.0), s + vec2(15.0, 0.0)],
+                    Stroke::new(1.0, white),
+                );
+                painter.line_segment(
+                    [s - vec2(0.0, 15.0), s + vec2(0.0, 15.0)],
+                    Stroke::new(1.0, white),
+                );
+                painter.text(
+                    s + vec2(17.0, -12.0),
+                    Align2::LEFT_BOTTOM,
+                    "coordinates?",
+                    FontId::proportional(11.0),
+                    white,
+                );
+            }
+        }
+
         // Cross-highlight marker from the graphs (or route hover).
         if let Some(i) = self.hover_index
             && let Some(s) = self.waypoint_screen(origin, i)

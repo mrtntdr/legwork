@@ -55,6 +55,17 @@ impl MapTransform {
         fit_affine(pts)
     }
 
+    /// Least-squares Helmert similarity (rotation + uniform scale + translation).
+    /// Two points determine it exactly; more are averaged. Unlike `fit`, extra
+    /// points never bend the mapping — used where the source really is a rigid
+    /// scaled rotation, like a map image placed against a projected grid.
+    pub fn fit_similarity(pts: &[Correspondence]) -> Option<MapTransform> {
+        if pts.len() < 2 {
+            return None;
+        }
+        fit_similarity(pts)
+    }
+
     /// Root-mean-square residual in pixels over the given correspondences.
     /// For exact fits this is ~0 at the control points.
     pub fn rms_residual(&self, pts: &[Correspondence]) -> f64 {

@@ -46,6 +46,18 @@ pub struct DrawnRoute {
     pub color: Option<[u8; 3]>,
 }
 
+/// A manually entered geographic reference point: a spot on the map image whose
+/// real-world WGS84 coordinates the user knows — typically a map corner read off
+/// the printed map's margin. Two or more georeference the map on their own, with
+/// no world file and no GPS track to calibrate against.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RefPoint {
+    /// Position in original-image pixel coordinates.
+    pub image_px: [f64; 2],
+    pub lat: f64,
+    pub lon: f64,
+}
+
 /// V1 only: a control attached to a waypoint of the (single) track. Kept so old
 /// projects still deserialize; converted to a `CoursePoint` on load.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,6 +141,10 @@ pub struct ProjectFileV2 {
     /// the feature; empty projects serialize the same as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<DrawnRoute>,
+    /// Manually entered map reference points (corner coordinates). `georef` holds
+    /// the map's *own* georeferencing, so both survive a save independently.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_points: Vec<RefPoint>,
 }
 
 /// The original single-track schema, kept so pre-multi-athlete projects still open.
@@ -206,6 +222,7 @@ mod tests {
         assert_eq!(p.controls[0].image_px, [10.0, 20.0]);
         // Fields added after this schema default cleanly for old files.
         assert!(p.routes.is_empty());
+        assert!(p.ref_points.is_empty());
         assert!(p.controls[0].score.is_none());
     }
 
@@ -222,9 +239,11 @@ mod tests {
             view: ViewState::default(),
             georef: None,
             routes: Vec::new(),
+            ref_points: Vec::new(),
         };
         let json = serde_json::to_string(&p).unwrap();
         assert!(!json.contains("routes"), "{json}");
+        assert!(!json.contains("ref_points"), "{json}");
         assert!(!json.contains("score"), "{json}");
     }
 
@@ -255,6 +274,11 @@ mod tests {
                     color: None,
                 },
             ],
+            ref_points: vec![RefPoint {
+                image_px: [0.0, 1200.0],
+                lat: 59.31,
+                lon: 18.02,
+            }],
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: ProjectFileV2 = serde_json::from_str(&json).unwrap();
@@ -264,5 +288,6 @@ mod tests {
         assert_eq!(back.routes[0].color, Some([10, 20, 30]));
         assert_eq!(back.routes[1].name, "Long way");
         assert!(back.routes[1].leg.is_none());
+        assert_eq!(back.ref_points, p.ref_points);
     }
 }

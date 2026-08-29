@@ -8,7 +8,8 @@ compare athletes leg by leg — on the map, in a splits table, and as an animate
 
 The app is organized around two activities:
 
-- **Setup** — load the map and tracks, calibrate each athlete, place the course.
+- **Setup** — load the map and tracks, georeference or calibrate each athlete, place
+  the course.
 - **Analysis** — the map is the read-only centerpiece: step through legs, replay the
   race, and open the splits/graphs drawers. A saved project opens straight here.
 
@@ -24,6 +25,16 @@ Pre-built files for Mac and Windows can be found under the relases: [https://git
 - **Rotate**: turn a sideways or angled photo/scan upright — ⟲/⟳ in 90° steps or a
   fine-angle slider (**Setup → Map**). The whole scene (routes, controls, pins)
   rotates about the canvas center, and the angle is saved with the project.
+- **Map corner coordinates** (Georeference mode): place the map in the world by hand —
+  pick a corner (**↖ NW / ↗ NE / ↘ SE / ↙ SW**) or click anywhere on the map, then type
+  that point's real coordinates. Two points are enough (opposite corners fit a
+  rotation + scale); three or more spread across the sheet fit a full affine that also
+  absorbs a scan's stretch. Coordinates are accepted in whatever notation you have them
+  in — `59.3321, 18.0654`, `N 59.3321 E 18.0654`, or `59°19'55.6"N 18°03'55.4"E`. This
+  georeferences a plain photo with **no world file and no GPS track at all**: tracks
+  land in place, IOF courses can be imported, and drawn routes measure in meters. The
+  points are saved with the project; drag a marker to correct it, right-click to remove
+  it, and clearing them falls back to the map file's own georeferencing.
 - **Georeferenced maps**: a world-file sidecar (`.pgw`/`.jgw`/`.tfw`/`.wld`, with an
   optional `.prj`) or embedded **GeoTIFF** tags are detected automatically when a map
   is opened — every track then lands on the map with **no manual calibration**.
@@ -111,7 +122,9 @@ On Linux you need the usual GUI dev packages: `libgtk-3-dev`, `libxcb-render0-de
    XML course; needs a georeferenced map or one calibrated track). Every athlete is
    matched to the course automatically.
    *Tip: if your map has a world file (e.g. `map.pgw`) or is a GeoTIFF, step 4 is
-   unnecessary — tracks align by themselves.*
+   unnecessary — tracks align by themselves. If it doesn't, **Georeference** mode gets
+   you the same thing from two corner coordinates: pick ↖ NW, type its lat/lon, then
+   ↘ SE and type that one.*
 6. Switch to the **Analysis** tab: step through legs with the strip above the map
    (or ←/→), open the **Splits** and **Graphs** drawers from the bottom bar, and
    tick **Replay** to animate the race (`Space` to play/pause).
@@ -132,7 +145,7 @@ src/
   io/                GPX/TCX parser, image loader, world-file/GeoTIFF georeferencing,
                      IOF XML course import, .legit container, PNG export
   geo/               local projection, transverse Mercator (UTM & friends),
-                     similarity / TPS interpolating warp solving
+                     lat/lon parsing, similarity / TPS interpolating warp solving
   analysis/          per-leg metrics, control↔track matching, cross-athlete
                      comparison, replay timing, pace/speed coloring
   ui/                map canvas (pan/zoom/drag, leg view, replay rendering),
